@@ -1,164 +1,177 @@
 import React from "react";
 import "katex/dist/katex.min.css";
-import { create, all } from "mathjs";
 import ConsolePanel from "./components/ConsolePanel";
 
-// Lightweight canvas-based phase portrait with param sliders + terminal console.
-// Focus: param detection (mu or μ), KaTeX console (no spam), nullclines, vector field, click-to-trace.
-
-const math = create(all, {});
-const RESERVED = new Set(["x", "y", "t", "e", "pi"]);
-const toAscii = (s) => s.replace(/\u03BC/g, "mu"); // map Greek μ -> mu
-
-function symbolNames(node) {
-  const out = new Set();
-  if (node?.traverse) {
-    node.traverse((n) => {
-      if (n.isSymbolNode && !RESERVED.has(n.name)) out.add(n.name);
-    });
-  }
-  return Array.from(out);
-}
+const lerp = (a, b, t) => a + (b - a) * t;
+const defaultDomain = { xMin: -3, xMax: 3, yMin: -3, yMax: 3 };
 
 function useLogs() {
   const [logs, setLogs] = React.useState([]);
-  const push = (type, text) =>
-    setLogs((L) => {
-      const last = L[L.length - 1];
-      if (last && last.type === type && last.text === text) return L; // de-dupe consecutive
-      return [...L.slice(-400), { type, text, ts: Date.now() }];
+  const push = React.useCallback((type, text) => {
+    setLogs((entries) => {
+      const last = entries[entries.length - 1];
+      if (last && last.type === type && last.text === text) return entries;
+      return [...entries.slice(-400), { type, text, ts: Date.now() }];
     });
-  const line = (t) => push("text", t);
-  const latex = (t) => push("latex", t);
-  const error = (t) => push("text", `Error: ${t}`);
-  return { logs, line, latex, error };
+  }, []);
+  const line = React.useCallback((t) => push("text", t), [push]);
+  const latex = React.useCallback((t) => push("latex", t), [push]);
+  const error = React.useCallback((t) => push("text", `Error: ${t}`), [push]);
+  const clear = React.useCallback(() => setLogs([]), []);
+  return { logs, line, latex, error, clear };
 }
 
-// Simple numeric helpers
-const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-const lerp = (a, b, t) => a + (b - a) * t;
-
 export default function PhasePlane() {
-  // Inputs
   const [exprX, setExprX] = React.useState("mu*x - x^2 - y");
   const [exprY, setExprY] = React.useState("x + mu*y - y^3");
-  const [domain, setDomain] = React.useState({ xMin: -3, xMax: 3, yMin: -3, yMax: 3 });
-  const [gridN, setGrid] = React.useState(40);
+  const [domain, setDomain] = React.useState(defaultDomain);
+  const [domainInputs, setDomainInputs] = React.useState(() => ({
+    xMin: String(defaultDomain.xMin),
+    xMax: String(defaultDomain.xMax),
+    yMin: String(defaultDomain.yMin),
+    yMax: String(defaultDomain.yMax),
+  }));
+  const [gridN, setGridN] = React.useState(40);
+  const [gridInput, setGridInput] = React.useState("40");
   const [params, setParams] = React.useState({});
   const [paramDefs, setParamDefs] = React.useState({});
   const [requiredParams, setRequiredParams] = React.useState([]);
-  const [compiled, setCompiled] = React.useState(null);
-  const [dx, setDx] = React.useState(null); // derivatives
-  const [dy, setDy] = React.useState(null);
   const [anim, setAnim] = React.useState({ enabled: false, key: null, speed: 0.4, min: -3, max: 3 });
-  const [seeds, setSeeds] = React.useState([]); // trajectory seeds
+  const [seeds, setSeeds] = React.useState([]);
+  const [workerData, setWorkerData] = React.useState(null);
+
   const canvasRef = React.useRef(null);
-  const lastReportRef = React.useRef(0);
-  const lastReportStateRef = React.useRef("");
+  const workerRef = React.useRef(null);
+  const requestIdRef = React.useRef(0);
+  const lastReportSigRef = React.useRef("");
+  const lastStatusRef = React.useRef("");
 
-  const scopeBase = React.useMemo(() => ({ t: 0, e: Math.E, pi: Math.PI }), []);
-  const { logs, line, latex, error } = useLogs();
+  const { logs, line, latex, error, clear: clearLogs } = useLogs();
 
-  // Parse & compile when exprs change
   React.useEffect(() => {
-    try {
-      const fx = toAscii(exprX);
-      const gy = toAscii(exprY);
-      const nodeX = math.parse(fx);
-      const nodeY = math.parse(gy);
-      // detect symbols -> params
-      const syms = [...new Set([...symbolNames(nodeX), ...symbolNames(nodeY)])];
-      const sortedSyms = [...syms].sort();
-      setRequiredParams(sortedSyms);
-      setParams((prev) => {
-        let changed = false;
-        const next = { ...prev };
-        sortedSyms.forEach((k) => {
-          if (!(k in next) || !Number.isFinite(next[k])) {
-            next[k] = 1;
-            changed = true;
-          }
+    const worker = new Worker(new URL("./workers/phaseWorker.js", import.meta.url));
+    workerRef.current = worker;
+    worker.onmessage = (event) => {
+      const { type, payload, requestId } = event.data || {};
+      if (type !== "result") return;
+      if (requestId && requestId !== requestIdRef.current) return;
+      const {
+        status,
+        requiredParams: req = [],
+        logs: newLogs = [],
+        reportSignature,
+        vectorField,
+        nullclines,
+        equilibria,
+        trajectories,
+        domain: domainResult,
+        gridN: gridResult,
+        message,
+        missingParams = [],
+      } = payload || {};
+
+      setRequiredParams(req);
+
+      if (status === "ok") {
+        setWorkerData({
+          vectorField: vectorField ?? [],
+          nullclines: nullclines ?? { f: [], g: [] },
+          equilibria: equilibria ?? [],
+          trajectories: trajectories ?? [],
+          domain: domainResult ?? domain,
+          gridN: gridResult ?? gridN,
         });
-        Object.keys(next).forEach((k) => {
-          if (!sortedSyms.includes(k)) {
-            delete next[k];
-            changed = true;
-          }
-        });
-        return changed ? next : prev;
+      } else {
+        setWorkerData(null);
+      }
+
+      if (newLogs.length) {
+        const signature = reportSignature || newLogs.map((entry) => `${entry.type}:${entry.text}`).join("|");
+        if (signature !== lastReportSigRef.current) {
+          lastReportSigRef.current = signature;
+          newLogs.forEach((entry) => {
+            if (entry.type === "latex") latex(entry.text);
+            else line(entry.text);
+          });
+        }
+      }
+
+      const statusSig = `${status}|${message || ""}|${missingParams.join(",")}`;
+      if (status === "ok") {
+        lastStatusRef.current = "ok";
+      } else if (status && statusSig !== lastStatusRef.current) {
+        if (status === "invalidDomain" && message) {
+          error(message);
+        } else if (status === "missingParams" && missingParams.length) {
+          line(`Set parameter values for: ${missingParams.join(", ")}`);
+        } else if (status === "error" && message) {
+          error(message);
+        }
+        lastStatusRef.current = statusSig;
+      }
+    };
+    worker.onerror = (evt) => {
+      error(evt?.message || "Worker error");
+    };
+    return () => {
+      worker.terminate();
+      workerRef.current = null;
+    };
+  }, [error, latex, line]);
+
+  React.useEffect(() => {
+    setParams((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      requiredParams.forEach((key) => {
+        if (!(key in next) || !Number.isFinite(next[key])) {
+          next[key] = 1;
+          changed = true;
+        }
       });
-      setParamDefs((prev) => {
-        let changed = false;
-        const next = { ...prev };
-        sortedSyms.forEach((k) => {
-          if (!(k in next)) {
-            next[k] = { min: -3, max: 3, step: 0.1 };
-            changed = true;
-          }
-        });
-        Object.keys(next).forEach((k) => {
-          if (!sortedSyms.includes(k)) {
-            delete next[k];
-            changed = true;
-          }
-        });
-        return changed ? next : prev;
+      Object.keys(next).forEach((key) => {
+        if (!requiredParams.includes(key)) {
+          delete next[key];
+          changed = true;
+        }
       });
-      const compiledX = nodeX.compile();
-      const compiledY = nodeY.compile();
-      // derivatives w.r.t x,y for Jacobian & Newton
-      const dfxdx = math.derivative(nodeX, "x").compile();
-      const dfxdy = math.derivative(nodeX, "y").compile();
-      const dfgdx = math.derivative(nodeY, "x").compile();
-      const dfgdy = math.derivative(nodeY, "y").compile();
-  
-      setCompiled({ nodeX, nodeY, compiledX, compiledY });
-      setDx({ dfxdx, dfxdy });
-      setDy({ dfgdx, dfgdy });
-      latex(`\\text{Parsed } f=${nodeX.toTex()}\\;,\\; g=${nodeY.toTex()}`);
-    } catch (e) {
-      setCompiled(null);
-      setDx(null);
-      setDy(null);
-      error(e.message);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [exprX, exprY]);
+      return changed ? next : prev;
+    });
+  }, [requiredParams]);
 
-  const evalFG = React.useCallback((x, y, t = 0) => {
-    if (!compiled) return [0, 0];
-    try {
-      const scope = { ...scopeBase, x, y, t, ...params };
-      return [Number(compiled.compiledX.evaluate(scope)), Number(compiled.compiledY.evaluate(scope))];
-    } catch {
-      return [NaN, NaN];
-    }
-  }, [compiled, params, scopeBase]);
+  React.useEffect(() => {
+    setParamDefs((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      requiredParams.forEach((key) => {
+        if (!(key in next)) {
+          next[key] = { min: -3, max: 3, step: 0.1 };
+          changed = true;
+        }
+      });
+      Object.keys(next).forEach((key) => {
+        if (!requiredParams.includes(key)) {
+          delete next[key];
+          changed = true;
+        }
+      });
+      return changed ? next : prev;
+    });
+  }, [requiredParams]);
 
-  const jacobianAt = React.useCallback((x, y) => {
-    if (!dx || !dy) return [[0, 0], [0, 0]];
-    const scope = { ...scopeBase, x, y, ...params };
-    const a = Number(dx.dfxdx.evaluate(scope));
-    const b = Number(dx.dfxdy.evaluate(scope));
-    const c = Number(dy.dfgdx.evaluate(scope));
-    const d = Number(dy.dfgdy.evaluate(scope));
-    return [[a, b], [c, d]];
-  }, [dx, dy, params, scopeBase]);
-
-  // Parameter animation
   React.useEffect(() => {
     if (!anim.enabled || !anim.key) return;
-    let raf = 0,
-      last = performance.now();
+    let raf = 0;
+    let last = performance.now();
     const { min, max, speed } = anim;
-    const span = (max - min) || 1;
+    const span = max - min || 1;
     const tick = (now) => {
       const dt = (now - last) / 1000;
       last = now;
-      setParams((p) => {
-        const cur = (p[anim.key] ?? 0) + speed * dt * span;
-        let v = min + (((cur - min) % span) + span) % span; // wrap
-        return { ...p, [anim.key]: v };
+      setParams((prev) => {
+        const cur = (prev[anim.key] ?? 0) + speed * dt * span;
+        const wrapped = min + (((cur - min) % span) + span) % span;
+        return { ...prev, [anim.key]: wrapped };
       });
       raf = requestAnimationFrame(tick);
     };
@@ -166,80 +179,62 @@ export default function PhasePlane() {
     return () => cancelAnimationFrame(raf);
   }, [anim]);
 
-  // Draw vector field + nullclines + seeds
+  React.useEffect(() => {
+    setDomainInputs({
+      xMin: String(domain.xMin),
+      xMax: String(domain.xMax),
+      yMin: String(domain.yMin),
+      yMax: String(domain.yMax),
+    });
+  }, [domain]);
+
+  React.useEffect(() => {
+    setGridInput(String(gridN));
+  }, [gridN]);
+
+  React.useEffect(() => {
+    const worker = workerRef.current;
+    if (!worker) return;
+    const requestId = requestIdRef.current + 1;
+    requestIdRef.current = requestId;
+    setWorkerData(null);
+    worker.postMessage({
+      type: "compute",
+      requestId,
+      payload: {
+        exprX,
+        exprY,
+        params,
+        domain,
+        gridN,
+        seeds,
+      },
+    });
+  }, [exprX, exprY, params, domain, gridN, seeds]);
+
   React.useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     const w = canvas.width;
     const h = canvas.height;
-
-    const paramsReady =
-      compiled &&
-      dx &&
-      dy &&
-      requiredParams.every((k) => Number.isFinite(params[k]));
-    if (!paramsReady) {
-      ctx.clearRect(0, 0, w, h);
-      return;
-    }
-
     ctx.clearRect(0, 0, w, h);
+    if (!workerData) return;
 
-    const { xMin, xMax, yMin, yMax } = domain;
+    const { vectorField = [], nullclines = { f: [], g: [] }, equilibria = [], trajectories = [], domain: drawDomain, gridN: drawGrid } = workerData;
+    const { xMin, xMax, yMin, yMax } = drawDomain ?? domain;
+
     const x2px = (x) => ((x - xMin) / (xMax - xMin)) * w;
     const y2px = (y) => (1 - (y - yMin) / (yMax - yMin)) * h;
-    const px2x = (px) => (px / w) * (xMax - xMin) + xMin;
-    const px2y = (py) => (1 - py / h) * (yMax - yMin) + yMin;
 
-    // vector field
-    const N = gridN;
-    ctx.save();
-    ctx.globalAlpha = 0.35;
-    for (let i = 0; i < N; i++) {
-      for (let j = 0; j < N; j++) {
-        const x = lerp(xMin, xMax, i / (N - 1));
-        const y = lerp(yMin, yMax, j / (N - 1));
-        const [u, v] = evalFG(x, y);
-        if (!isFinite(u) || !isFinite(v)) continue;
-        const m = Math.hypot(u, v) || 1e-6;
-        const scale = 0.6 * Math.min(w, h) / (N * 4);
-        const dxv = (u / m) * scale;
-        const dyv = (v / m) * scale;
-        const px = x2px(x);
-        const py = y2px(y);
-        // arrow
-        ctx.beginPath();
-        ctx.moveTo(px - dxv, py - dyv);
-        ctx.lineTo(px + dxv, py + dyv);
-        ctx.strokeStyle = "#94a3b8";
-        ctx.lineWidth = 1.2;
-        ctx.stroke();
-        // head
-        const ang = Math.atan2(dyv, dxv);
-        const head = 3;
-        ctx.beginPath();
-        ctx.moveTo(px + dxv, py + dyv);
-        ctx.lineTo(px + dxv - head * Math.cos(ang - Math.PI / 6), py + dyv - head * Math.sin(ang - Math.PI / 6));
-        ctx.lineTo(px + dxv - head * Math.cos(ang + Math.PI / 6), py + dyv - head * Math.sin(ang + Math.PI / 6));
-        ctx.closePath();
-        ctx.fillStyle = "#94a3b8";
-        ctx.fill();
-      }
-    }
-    ctx.restore();
-
-    // axes
     ctx.save();
     ctx.strokeStyle = "#475569";
     ctx.lineWidth = 1;
-    // x-axis
     const y0 = y2px(0);
     ctx.beginPath();
     ctx.moveTo(0, y0);
     ctx.lineTo(w, y0);
     ctx.stroke();
-    // y-axis
     const x0 = x2px(0);
     ctx.beginPath();
     ctx.moveTo(x0, 0);
@@ -247,445 +242,217 @@ export default function PhasePlane() {
     ctx.stroke();
     ctx.restore();
 
-    const approxEqual = (p, q) => Math.hypot(p[0] - q[0], p[1] - q[1]) < 1e-6;
-    const pointKey = (p) => `${Math.round(p[0] * 1e6)}:${Math.round(p[1] * 1e6)}`;
-    const buildPolylines = (segments) => {
-      const polylines = [];
-      const used = new Array(segments.length).fill(false);
-      const adjacency = new Map();
-      segments.forEach((seg, idx) => {
-        const [a, b] = seg;
-        const ka = pointKey(a);
-        const kb = pointKey(b);
-        if (!adjacency.has(ka)) adjacency.set(ka, []);
-        if (!adjacency.has(kb)) adjacency.set(kb, []);
-        adjacency.get(ka).push(idx);
-        adjacency.get(kb).push(idx);
-      });
+    ctx.save();
+    ctx.globalAlpha = 0.35;
+    const scale = 0.6 * Math.min(w, h) / (Math.max(1, drawGrid) * 4);
+    vectorField.forEach(({ x, y, u, v }) => {
+      const magnitude = Math.hypot(u, v) || 1e-6;
+      const dx = (u / magnitude) * scale;
+      const dy = (v / magnitude) * scale;
+      const px = x2px(x);
+      const py = y2px(y);
+      ctx.beginPath();
+      ctx.moveTo(px - dx, py - dy);
+      ctx.lineTo(px + dx, py + dy);
+      ctx.strokeStyle = "#94a3b8";
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+      const angle = Math.atan2(dy, dx);
+      const head = 3;
+      ctx.beginPath();
+      ctx.moveTo(px + dx, py + dy);
+      ctx.lineTo(px + dx - head * Math.cos(angle - Math.PI / 6), py + dy - head * Math.sin(angle - Math.PI / 6));
+      ctx.lineTo(px + dx - head * Math.cos(angle + Math.PI / 6), py + dy - head * Math.sin(angle + Math.PI / 6));
+      ctx.closePath();
+      ctx.fillStyle = "#94a3b8";
+      ctx.fill();
+    });
+    ctx.restore();
 
-      const extend = (startPoint, forward, polyline) => {
-        let current = startPoint;
-        while (true) {
-          const opts = adjacency.get(pointKey(current)) || [];
-          let foundIdx = -1;
-          let nextPoint = null;
-          for (const idx of opts) {
-            if (used[idx]) continue;
-            const [p0, p1] = segments[idx];
-            if (approxEqual(current, p0)) {
-              foundIdx = idx;
-              nextPoint = p1;
-              break;
-            }
-            if (approxEqual(current, p1)) {
-              foundIdx = idx;
-              nextPoint = p0;
-              break;
-            }
-          }
-          if (foundIdx === -1 || !nextPoint) break;
-          used[foundIdx] = true;
-          if (forward) polyline.push(nextPoint);
-          else polyline.unshift(nextPoint);
-          current = nextPoint;
-        }
-      };
-
-      segments.forEach((seg, idx) => {
-        if (used[idx]) return;
-        used[idx] = true;
-        const polyline = [seg[0], seg[1]];
-        extend(polyline[polyline.length - 1], true, polyline);
-        extend(polyline[0], false, polyline);
-        polylines.push(polyline);
-      });
-
-      return polylines;
-    };
-
-    function drawNullcline(which = "f") {
-      const M = Math.max(80, Math.min(200, Math.floor(gridN * 2.5)));
-      const values = new Array(M + 1);
-      const dxCell = (xMax - xMin) / M;
-      const dyCell = (yMax - yMin) / M;
-      for (let i = 0; i <= M; i++) {
-        values[i] = new Array(M + 1);
-        for (let j = 0; j <= M; j++) {
-          const x = xMin + i * dxCell;
-          const y = yMin + j * dyCell;
-          const [u, v] = evalFG(x, y);
-          values[i][j] = which === "f" ? u : v;
-        }
-      }
-
-      const valEps = 1e-9;
-      const segments = [];
-      const edgePoint = (i, j, edge) => {
-        const x0 = xMin + i * dxCell;
-        const x1 = xMin + (i + 1) * dxCell;
-        const y0 = yMin + j * dyCell;
-        const y1 = yMin + (j + 1) * dyCell;
-        switch (edge) {
-          case 0: { // bottom
-            const v0 = values[i][j];
-            const v1 = values[i + 1][j];
-            const denom = v0 - v1;
-            const t = clamp(Math.abs(denom) < valEps ? 0.5 : v0 / denom, 0, 1);
-            return [lerp(x0, x1, t), y0];
-          }
-          case 1: { // right
-            const v0 = values[i + 1][j];
-            const v1 = values[i + 1][j + 1];
-            const denom = v0 - v1;
-            const t = clamp(Math.abs(denom) < valEps ? 0.5 : v0 / denom, 0, 1);
-            return [x1, lerp(y0, y1, t)];
-          }
-          case 2: { // top
-            const v0 = values[i][j + 1];
-            const v1 = values[i + 1][j + 1];
-            const denom = v0 - v1;
-            const t = clamp(Math.abs(denom) < valEps ? 0.5 : v0 / denom, 0, 1);
-            return [lerp(x0, x1, t), y1];
-          }
-          case 3: { // left
-            const v0 = values[i][j];
-            const v1 = values[i][j + 1];
-            const denom = v0 - v1;
-            const t = clamp(Math.abs(denom) < valEps ? 0.5 : v0 / denom, 0, 1);
-            return [x0, lerp(y0, y1, t)];
-          }
-          default:
-            return [x0, y0];
-        }
-      };
-
-      const crosses = (a, b) => {
-        if (!isFinite(a) || !isFinite(b)) return false;
-        if (Math.abs(a) < valEps && Math.abs(b) < valEps) return true; // treat edge-on-zero as crossing
-        if (Math.abs(a) < valEps || Math.abs(b) < valEps) return true;
-        return a * b < 0;
-      };
-
-      for (let i = 0; i < M; i++) {
-        for (let j = 0; j < M; j++) {
-          const c00 = values[i][j];
-          const c10 = values[i + 1][j];
-          const c11 = values[i + 1][j + 1];
-          const c01 = values[i][j + 1];
-          const pts = [];
-          if (crosses(c00, c10)) pts.push({ edge: 0, point: edgePoint(i, j, 0) });
-          if (crosses(c10, c11)) pts.push({ edge: 1, point: edgePoint(i, j, 1) });
-          if (crosses(c01, c11)) pts.push({ edge: 2, point: edgePoint(i, j, 2) });
-          if (crosses(c00, c01)) pts.push({ edge: 3, point: edgePoint(i, j, 3) });
-          if (pts.length === 0) continue;
-          const counts = new Map();
-          const uniquePts = [];
-          for (const entry of pts) {
-            const key = pointKey(entry.point);
-            counts.set(key, (counts.get(key) ?? 0) + 1);
-            if (!uniquePts.some((u) => approxEqual(u.point, entry.point))) {
-              uniquePts.push({ ...entry, key });
-            }
-          }
-          if (uniquePts.length === 2) {
-            segments.push([uniquePts[0].point, uniquePts[1].point]);
-          } else if (uniquePts.length === 3) {
-            const hub = uniquePts.find((u) => (counts.get(u.key) ?? 0) > 1);
-            if (hub) {
-              uniquePts.forEach((u) => {
-                if (u === hub) return;
-                segments.push([hub.point, u.point]);
-              });
-            } else {
-              uniquePts
-                .sort((a, b) => a.edge - b.edge)
-                .reduce((prev, curr) => {
-                  if (prev) segments.push([prev.point, curr.point]);
-                  return curr;
-                }, null);
-            }
-          } else if (uniquePts.length === 4) {
-            const xc = xMin + (i + 0.5) * dxCell;
-            const yc = yMin + (j + 0.5) * dyCell;
-            const [uf, vf] = evalFG(xc, yc);
-            const centerVal = which === "f" ? uf : vf;
-            const ordered = uniquePts.slice().sort((a, b) => a.edge - b.edge);
-            if (centerVal > 0) {
-              segments.push([ordered[0].point, ordered[1].point]);
-              segments.push([ordered[2].point, ordered[3].point]);
-            } else {
-              segments.push([ordered[0].point, ordered[3].point]);
-              segments.push([ordered[1].point, ordered[2].point]);
-            }
-          }
-        }
-      }
-      const polylines = buildPolylines(segments);
-
+    const drawPolylines = (polylines, color) => {
       ctx.save();
       ctx.lineWidth = 1.6;
       ctx.lineJoin = "round";
       ctx.lineCap = "round";
-      ctx.strokeStyle = which === "f" ? "#22d3ee" : "#f472b6";
-      for (const polyline of polylines) {
-        if (polyline.length < 2) continue;
+      ctx.strokeStyle = color;
+      polylines.forEach((polyline) => {
+        if (!polyline || polyline.length < 2) return;
         ctx.beginPath();
-        polyline.forEach(([lx, ly], idx) => {
-          const px = x2px(lx);
-          const py = y2px(ly);
+        polyline.forEach(([x, y], idx) => {
+          const px = x2px(x);
+          const py = y2px(y);
           if (idx === 0) ctx.moveTo(px, py);
           else ctx.lineTo(px, py);
         });
         ctx.stroke();
-      }
+      });
       ctx.restore();
-
-      return segments;
-    }
-
-    const nullclineF = drawNullcline("f");
-    const nullclineG = drawNullcline("g");
-
-    const segTol = 1e-6;
-    const intersections = [];
-    const segmentIntersect = (a0, a1, b0, b1) => {
-      const r0 = [a1[0] - a0[0], a1[1] - a0[1]];
-      const r1 = [b1[0] - b0[0], b1[1] - b0[1]];
-      const det = r0[0] * r1[1] - r0[1] * r1[0];
-      if (Math.abs(det) < segTol) return null;
-      const diff = [b0[0] - a0[0], b0[1] - a0[1]];
-      const t = (diff[0] * r1[1] - diff[1] * r1[0]) / det;
-      const u = (diff[0] * r0[1] - diff[1] * r0[0]) / det;
-      if (t < -segTol || t > 1 + segTol || u < -segTol || u > 1 + segTol) return null;
-      return [a0[0] + t * r0[0], a0[1] + t * r0[1]];
     };
 
-    for (const segF of nullclineF) {
-      for (const segG of nullclineG) {
-        const pt = segmentIntersect(segF[0], segF[1], segG[0], segG[1]);
-        if (pt) intersections.push(pt);
-      }
-    }
+    drawPolylines(nullclines.f, "#22d3ee");
+    drawPolylines(nullclines.g, "#f472b6");
 
-    const refinePoint = (x0, y0) => {
-      let x = x0;
-      let y = y0;
-      for (let it = 0; it < 25; it++) {
-        const [u, v] = evalFG(x, y);
-        if (!isFinite(u) || !isFinite(v)) return null;
-        const J = jacobianAt(x, y);
-        const det = J[0][0] * J[1][1] - J[0][1] * J[1][0];
-        if (!isFinite(det) || Math.abs(det) < 1e-12) return null;
-        const dxn = (-u * J[1][1] + v * J[0][1]) / det;
-        const dyn = (-v * J[0][0] + u * J[1][0]) / det;
-        x += dxn;
-        y += dyn;
-        if (Math.hypot(dxn, dyn) < 1e-9) break;
-      }
-      const [uf, vf] = evalFG(x, y);
-      if (!isFinite(uf) || !isFinite(vf) || Math.hypot(uf, vf) > 1e-5) return null;
-      return [x, y];
-    };
-
-    const refinedPoints = [];
-    for (const pt of intersections) {
-      const refined = refinePoint(pt[0], pt[1]);
-      if (!refined) continue;
-      if (!refinedPoints.some((q) => Math.hypot(q[0] - refined[0], q[1] - refined[1]) < 1e-4)) {
-        refinedPoints.push(refined);
-      }
-    }
-
-    // Also seed from a coarse near-zero |F| grid and refine (captures vertex/edge zeros like (0,0))
-    {
-      const Mseed = 36;
-      for (let i = 0; i <= Mseed; i++) {
-        for (let j = 0; j <= Mseed; j++) {
-          const x = lerp(xMin, xMax, i / Mseed);
-          const y = lerp(yMin, yMax, j / Mseed);
-          const [u, v] = evalFG(x, y);
-          if (!isFinite(u) || !isFinite(v)) continue;
-          if (Math.hypot(u, v) < 1e-2) {
-            const refined = refinePoint(x, y);
-            if (refined && !refinedPoints.some((q) => Math.hypot(q[0] - refined[0], q[1] - refined[1]) < 1e-4)) {
-              refinedPoints.push(refined);
-            }
-          }
-        }
-      }
-    }
     ctx.save();
     ctx.fillStyle = "#fef08a";
     ctx.strokeStyle = "#f59e0b";
-    for (const [x, y] of refinedPoints) {
+    equilibria.forEach(({ x, y }) => {
       const px = x2px(x);
       const py = y2px(y);
       ctx.beginPath();
       ctx.arc(px, py, 4, 0, Math.PI * 2);
       ctx.fill();
       ctx.stroke();
-    }
+    });
     ctx.restore();
-
-    const sortedParams = Object.keys(params)
-      .sort()
-      .map((k) => `${k}:${Number(params[k]).toFixed(3)}`)
-      .join("|");
-    const signature = `${exprX}|${exprY}|${sortedParams}|${refinedPoints
-      .map((p) => `${p[0].toFixed(4)},${p[1].toFixed(4)}`)
-      .join("|")}`;
-    const nowReport = performance.now?.() ?? Date.now();
-    if (signature !== lastReportStateRef.current || nowReport - lastReportRef.current > 500) {
-      lastReportStateRef.current = signature;
-      lastReportRef.current = nowReport;
-      if (compiled) {
-        const fTex = compiled.nodeX.toTex();
-        const gTex = compiled.nodeY.toTex();
-        latex(`\\text{Nullclines: }\\; f(x,y)=0:\\; ${fTex}=0\\quad g(x,y)=0:\\; ${gTex}=0`);
-      }
-      if (refinedPoints.length === 0) {
-        latex(`\\text{Fixed points: none detected in domain.}`);
-      } else {
-        const fmtPt = (x, y) => `(${x.toFixed(3)},\\;${y.toFixed(3)})`;
-        latex(
-          `\\text{Fixed points (approx): } ${refinedPoints
-            .map((p, i) => `P_{${i + 1}}=${fmtPt(p[0], p[1])}`)
-            .join(",\\;")}`
-        );
-        const classify = (tr, det, disc) => {
-          if (!isFinite(tr) || !isFinite(det)) return "indeterminate";
-          if (Math.abs(det) < 1e-10) return "degenerate";
-          if (det < 0) return "saddle";
-          if (disc < 0) return Math.abs(tr) < 1e-6 ? "center" : tr < 0 ? "spiral sink" : "spiral source";
-          if (disc > 0) return tr < 0 ? "node sink" : "node source";
-          return tr < 0 ? "degenerate sink" : "degenerate source";
-        };
-        for (const [x, y] of refinedPoints) {
-          const J = jacobianAt(x, y);
-          const tr = J[0][0] + J[1][1];
-          const det = J[0][0] * J[1][1] - J[0][1] * J[1][0];
-          const disc = tr * tr - 4 * det;
-          const cls = classify(tr, det, disc);
-          const stability = cls.includes("sink") || cls === "center" ? (cls === "center" ? "neutral" : "stable") : cls === "saddle" ? "unstable" : tr > 0 ? "unstable" : "stable";
-          if (disc >= 0) {
-            const l1 = 0.5 * (tr + Math.sqrt(Math.max(0, disc)));
-            const l2 = 0.5 * (tr - Math.sqrt(Math.max(0, disc)));
-            latex(
-              `\\text{At } ${fmtPt(x, y)}:\\; J=\\begin{pmatrix}${J[0][0].toFixed(3)}&${J[0][1].toFixed(3)}\\\\${J[1][0].toFixed(3)}&${J[1][1].toFixed(3)}\\end{pmatrix},\\; \\\\ \\mathrm{tr}=${tr.toFixed(3)},\\; \\det=${det.toFixed(3)},\\; \\lambda_{1,2}=${l1
-                .toFixed(3)}\\;${l2.toFixed(3)}\\;,\\; \\text{class: ${cls} (${stability})}`
-            );
-          } else {
-            const re = 0.5 * tr;
-            const im = 0.5 * Math.sqrt(-disc);
-            latex(
-              `\\text{At } ${fmtPt(x, y)}:\\; J=\\begin{pmatrix}${J[0][0].toFixed(3)}&${J[0][1].toFixed(3)}\\\\${J[1][0].toFixed(3)}&${J[1][1].toFixed(3)}\\end{pmatrix},\\; \\\\ \\mathrm{tr}=${tr.toFixed(3)},\\; \\det=${det.toFixed(3)},\\; \\lambda=${re.toFixed(3)}\\pm ${im.toFixed(3)}i\\;,\\; \\text{class: ${cls} (${stability})}`
-            );
-          }
-        }
-      }
-    }
-
-    // trajectories
-    function integrate(x0, y0, dir = +1, steps = 2000, hstep = 0.01) {
-      let x = x0, y = y0;
-      const pts = [];
-      for (let k = 0; k < steps; k++) {
-        const [u, v] = evalFG(x, y);
-        if (!isFinite(u) || !isFinite(v)) break;
-        // RK2 (midpoint) for a bit more stability
-        const mx = x + 0.5 * dir * hstep * u;
-        const my = y + 0.5 * dir * hstep * v;
-        const [uu, vv] = evalFG(mx, my);
-        x += dir * hstep * uu;
-        y += dir * hstep * vv;
-        if (x < xMin - 1 || x > xMax + 1 || y < yMin - 1 || y > yMax + 1) break;
-        pts.push([x, y]);
-      }
-      return pts;
-    }
 
     ctx.save();
     ctx.lineWidth = 2;
-    seeds.forEach((s) => {
-      // forward
-      let pts = integrate(s[0], s[1], +1, 800, 0.01);
-      // backward
-      const ptsB = integrate(s[0], s[1], -1, 800, 0.01).reverse();
-      pts = ptsB.concat([[s[0], s[1]]], pts);
-      // draw with arrows along
-      ctx.strokeStyle = "#eab308";
+    ctx.strokeStyle = "#eab308";
+    trajectories.forEach(({ path }) => {
+      if (!path || path.length < 2) return;
       ctx.beginPath();
-      for (let i = 0; i < pts.length; i++) {
-        const [x, y] = pts[i];
-        const px = x2px(x), py = y2px(y);
-        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
-      }
+      path.forEach(([x, y], idx) => {
+        const px = x2px(x);
+        const py = y2px(y);
+        if (idx === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      });
       ctx.stroke();
-      // arrowheads sparsely
-      for (let i = 15; i < pts.length; i += 25) {
-        const [x1, y1] = pts[i - 1];
-        const [x2, y2] = pts[i];
-        const ang = Math.atan2(y2 - y1, x2 - x1);
-        const px = x2px(x2), py = y2px(y2);
+      for (let i = 15; i < path.length; i += 25) {
+        const [x1, y1] = path[i - 1];
+        const [x2, y2] = path[i];
+        const angle = Math.atan2(y2 - y1, x2 - x1);
+        const px = x2px(x2);
+        const py = y2px(y2);
         const head = 4;
         ctx.beginPath();
         ctx.moveTo(px, py);
-        ctx.lineTo(px - head * Math.cos(ang - Math.PI / 6), py - head * Math.sin(ang - Math.PI / 6));
-        ctx.lineTo(px - head * Math.cos(ang + Math.PI / 6), py - head * Math.sin(ang + Math.PI / 6));
+        ctx.lineTo(px - head * Math.cos(angle - Math.PI / 6), py - head * Math.sin(angle - Math.PI / 6));
+        ctx.lineTo(px - head * Math.cos(angle + Math.PI / 6), py - head * Math.sin(angle + Math.PI / 6));
         ctx.closePath();
         ctx.fillStyle = "#eab308";
         ctx.fill();
       }
     });
     ctx.restore();
+  }, [workerData, domain]);
 
-    // pointer handler
-    const onClick = (evt) => {
+  React.useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const handleClick = (evt) => {
       const rect = canvas.getBoundingClientRect();
       const px = evt.clientX - rect.left;
       const py = evt.clientY - rect.top;
-      const x = px2x(px);
-      const y = px2y(py);
-      setSeeds((S) => [...S, [x, y]]);
+      const x = (px / canvas.width) * (domain.xMax - domain.xMin) + domain.xMin;
+      const y = (1 - py / canvas.height) * (domain.yMax - domain.yMin) + domain.yMin;
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+      setSeeds((prev) => [...prev, [x, y]]);
     };
-    canvas.addEventListener("click", onClick);
-    return () => canvas.removeEventListener("click", onClick);
-  }, [compiled, params, domain, gridN, seeds, anim, dx, dy, evalFG, jacobianAt, requiredParams, exprX, exprY, latex]);
+    canvas.addEventListener("click", handleClick);
+    return () => canvas.removeEventListener("click", handleClick);
+  }, [domain]);
 
-  // Console command handler
-  const onCommand = (s) => {
-    const [c, ...rest] = s.trim().split(/\s+/);
-    if (c === "help") {
-      return line("commands: set <param> <value> | grid <N> | bounds xMin xMax yMin yMax | clear");
+  const handleDomainInputChange = (key) => (event) => {
+    const value = event.target.value;
+    setDomainInputs((prev) => ({ ...prev, [key]: value }));
+  };
+
+  const commitDomainValue = (key) => () => {
+    setDomainInputs((prev) => {
+      const raw = prev[key];
+      if (typeof raw !== "string" || raw.trim() === "") {
+        return { ...prev, [key]: String(domain[key]) };
+      }
+      const parsed = Number(raw);
+      if (!Number.isFinite(parsed)) {
+        return { ...prev, [key]: String(domain[key]) };
+      }
+      const next = { ...domain, [key]: parsed };
+      if (next.xMin >= next.xMax || next.yMin >= next.yMax) {
+        error("Bounds must satisfy xMin < xMax and yMin < yMax");
+        return { ...prev, [key]: String(domain[key]) };
+      }
+      setDomain(next);
+      return prev;
+    });
+  };
+
+  const handleDomainKeyDown = (key) => (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      commitDomainValue(key)();
+      event.currentTarget.blur();
     }
-    if (c === "clear") {
-      // clear logs
-      return window.location.reload();
+  };
+
+  const handleGridChange = (event) => {
+    setGridInput(event.target.value);
+  };
+
+  const commitGrid = () => {
+    const raw = gridInput.trim();
+    const parsed = Number(raw);
+    if (!Number.isInteger(parsed) || parsed < 8 || parsed > 200) {
+      error("Grid must be an integer between 8 and 200");
+      setGridInput(String(gridN));
+      return;
     }
-    if (c === "set" && rest.length === 2) {
+    setGridN(parsed);
+  };
+
+  const handleGridKeyDown = (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      commitGrid();
+      event.currentTarget.blur();
+    }
+  };
+
+  const onCommand = (input) => {
+    const [cmd, ...rest] = input.trim().split(/\s+/);
+    if (cmd === "help") {
+      line("commands: set <param> <value> | grid <N> | bounds xMin xMax yMin yMax | clear");
+      return;
+    }
+    if (cmd === "clear") {
+      clearLogs();
+      return;
+    }
+    if (cmd === "set" && rest.length === 2) {
       const [name, val] = rest;
-      if (!(name in params)) return line(`unknown param "${name}"`);
+      if (!(name in params)) {
+        line(`unknown param "${name}"`);
+        return;
+      }
       const num = Number(val);
-      if (!Number.isFinite(num)) return line("value must be a number");
-      setParams((p) => ({ ...p, [name]: num }));
+      if (!Number.isFinite(num)) {
+        line("value must be a number");
+        return;
+      }
+      setParams((prev) => ({ ...prev, [name]: num }));
       return;
     }
-    if (c === "grid" && rest.length === 1) {
+    if (cmd === "grid" && rest.length === 1) {
       const n = Number(rest[0]);
-      if (!Number.isInteger(n) || n < 8 || n > 200) return line("grid must be 8..200");
-      setGrid(n);
+      if (!Number.isInteger(n) || n < 8 || n > 200) {
+        line("grid must be 8..200");
+        return;
+      }
+      setGridN(n);
       return;
     }
-    if (c === "bounds" && rest.length === 4) {
-      const [a, b, c1, d] = rest.map(Number);
-      if ([a, b, c1, d].some((v) => !Number.isFinite(v)) || a >= b || c1 >= d) return line("bad bounds");
-      setDomain({ xMin: a, xMax: b, yMin: c1, yMax: d });
+    if (cmd === "bounds" && rest.length === 4) {
+      const [a, b, c, d] = rest.map(Number);
+      if (![a, b, c, d].every(Number.isFinite) || a >= b || c >= d) {
+        line("bad bounds");
+        return;
+      }
+      setDomain({ xMin: a, xMax: b, yMin: c, yMax: d });
       return;
     }
     line("unknown command (help)");
   };
-
-  // UI
 
   return (
     <div className="bg-slate-900 text-slate-100 pt-4 px-4 pb-0">
@@ -703,7 +470,7 @@ export default function PhasePlane() {
                 <input
                   className="w-56 bg-slate-900/60 rounded px-2 py-1 border border-slate-700"
                   value={exprX}
-                  onChange={(e) => setExprX(e.target.value)}
+                  onChange={(event) => setExprX(event.target.value)}
                 />
               </div>
               <div className="flex items-center gap-2">
@@ -711,7 +478,7 @@ export default function PhasePlane() {
                 <input
                   className="w-56 bg-slate-900/60 rounded px-2 py-1 border border-slate-700"
                   value={exprY}
-                  onChange={(e) => setExprY(e.target.value)}
+                  onChange={(event) => setExprY(event.target.value)}
                 />
               </div>
               <div className="flex items-center gap-2">
@@ -720,38 +487,49 @@ export default function PhasePlane() {
                   title="xMin"
                   className="w-16 bg-slate-900/60 rounded px-2 py-1 border border-slate-700"
                   type="number"
-                  value={domain.xMin}
-                  onChange={(e) => setDomain((d) => ({ ...d, xMin: Number(e.target.value) }))}
+                  value={domainInputs.xMin}
+                  onChange={handleDomainInputChange("xMin")}
+                  onBlur={commitDomainValue("xMin")}
+                  onKeyDown={handleDomainKeyDown("xMin")}
                 />
                 <input
                   title="xMax"
                   className="w-16 bg-slate-900/60 rounded px-2 py-1 border border-slate-700"
                   type="number"
-                  value={domain.xMax}
-                  onChange={(e) => setDomain((d) => ({ ...d, xMax: Number(e.target.value) }))}
+                  value={domainInputs.xMax}
+                  onChange={handleDomainInputChange("xMax")}
+                  onBlur={commitDomainValue("xMax")}
+                  onKeyDown={handleDomainKeyDown("xMax")}
                 />
                 <input
                   title="yMin"
                   className="w-16 bg-slate-900/60 rounded px-2 py-1 border border-slate-700"
                   type="number"
-                  value={domain.yMin}
-                  onChange={(e) => setDomain((d) => ({ ...d, yMin: Number(e.target.value) }))}
+                  value={domainInputs.yMin}
+                  onChange={handleDomainInputChange("yMin")}
+                  onBlur={commitDomainValue("yMin")}
+                  onKeyDown={handleDomainKeyDown("yMin")}
                 />
                 <input
                   title="yMax"
                   className="w-16 bg-slate-900/60 rounded px-2 py-1 border border-slate-700"
                   type="number"
-                  value={domain.yMax}
-                  onChange={(e) => setDomain((d) => ({ ...d, yMax: Number(e.target.value) }))}
+                  value={domainInputs.yMax}
+                  onChange={handleDomainInputChange("yMax")}
+                  onBlur={commitDomainValue("yMax")}
+                  onKeyDown={handleDomainKeyDown("yMax")}
                 />
-                <label className="text-xs text-slate-300">grid
+                <label className="text-xs text-slate-300">
+                  grid
                   <input
                     className="ml-2 w-20 bg-slate-900/60 rounded px-2 py-1 border border-slate-700"
                     type="number"
-                    value={gridN}
+                    value={gridInput}
                     min={8}
                     max={200}
-                    onChange={(e) => setGrid(clamp(Number(e.target.value)||40, 8, 200))}
+                    onChange={handleGridChange}
+                    onBlur={commitGrid}
+                    onKeyDown={handleGridKeyDown}
                   />
                 </label>
                 <button
@@ -760,7 +538,7 @@ export default function PhasePlane() {
                   onClick={() => {
                     const x = lerp(domain.xMin, domain.xMax, Math.random());
                     const y = lerp(domain.yMin, domain.yMax, Math.random());
-                    setSeeds((S) => [...S, [x, y]]);
+                    setSeeds((prev) => [...prev, [x, y]]);
                   }}
                 >
                   Seed
@@ -786,19 +564,19 @@ export default function PhasePlane() {
                   <input
                     type="checkbox"
                     checked={anim.enabled}
-                    onChange={(e) => setAnim((a) => ({ ...a, enabled: e.target.checked }))}
+                    onChange={(event) => setAnim((prev) => ({ ...prev, enabled: event.target.checked }))}
                   />
                   Animate
                 </label>
                 <select
                   className="text-xs bg-slate-900/60 rounded px-2 py-1 border border-slate-700"
                   value={anim.key ?? ""}
-                  onChange={(e) => setAnim((a) => ({ ...a, key: e.target.value || null }))}
+                  onChange={(event) => setAnim((prev) => ({ ...prev, key: event.target.value || null }))}
                 >
                   <option value="">(param)</option>
-                  {Object.keys(params).map((k) => (
-                    <option key={k} value={k}>
-                      {k}
+                  {Object.keys(params).map((key) => (
+                    <option key={key} value={key}>
+                      {key}
                     </option>
                   ))}
                 </select>
@@ -809,7 +587,7 @@ export default function PhasePlane() {
                     type="number"
                     step="0.1"
                     value={anim.speed}
-                    onChange={(e) => setAnim((a) => ({ ...a, speed: Number(e.target.value) || 0 }))}
+                    onChange={(event) => setAnim((prev) => ({ ...prev, speed: Number(event.target.value) || 0 }))}
                     disabled={!anim.key}
                   />
                 </label>
@@ -822,26 +600,26 @@ export default function PhasePlane() {
                   No free parameters detected. Use symbols like <code>mu</code> or Greek <code>μ</code> in f,g.
                 </div>
               )}
-              {Object.keys(params).map((k) => {
-                const def = paramDefs[k] ?? { min: -3, max: 3, step: 0.1 };
+              {Object.keys(params).map((key) => {
+                const def = paramDefs[key] ?? { min: -3, max: 3, step: 0.1 };
                 return (
-                  <div key={k} className="flex items-center gap-3">
-                    <div className="w-10 text-xs text-slate-300">{k}</div>
+                  <div key={key} className="flex items-center gap-3">
+                    <div className="w-10 text-xs text-slate-300">{key}</div>
                     <input
                       className="flex-1"
                       type="range"
                       min={def.min}
                       max={def.max}
                       step={def.step}
-                      value={params[k]}
-                      onChange={(e) => setParams((p) => ({ ...p, [k]: Number(e.target.value) }))}
+                      value={params[key]}
+                      onChange={(event) => setParams((prev) => ({ ...prev, [key]: Number(event.target.value) }))}
                     />
                     <input
                       className="w-24 bg-slate-900/60 rounded px-2 py-1 border border-slate-700 text-sm"
                       type="number"
                       step={def.step}
-                      value={params[k]}
-                      onChange={(e) => setParams((p) => ({ ...p, [k]: Number(e.target.value) }))}
+                      value={params[key]}
+                      onChange={(event) => setParams((prev) => ({ ...prev, [key]: Number(event.target.value) }))}
                     />
                   </div>
                 );
