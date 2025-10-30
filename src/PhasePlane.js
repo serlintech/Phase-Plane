@@ -46,13 +46,15 @@ export default function PhasePlane() {
   const [gridN, setGrid] = React.useState(40);
   const [params, setParams] = React.useState({});
   const [paramDefs, setParamDefs] = React.useState({});
+  const [requiredParams, setRequiredParams] = React.useState([]);
   const [compiled, setCompiled] = React.useState(null);
   const [dx, setDx] = React.useState(null); // derivatives
   const [dy, setDy] = React.useState(null);
   const [anim, setAnim] = React.useState({ enabled: false, key: null, speed: 0.4, min: -3, max: 3 });
   const [seeds, setSeeds] = React.useState([]); // trajectory seeds
   const canvasRef = React.useRef(null);
-  const [fixedPoints, setFixedPoints] = React.useState([]);
+  const lastReportRef = React.useRef(0);
+  const lastReportStateRef = React.useRef("");
 
   const scopeBase = React.useMemo(() => ({ t: 0, e: Math.E, pi: Math.PI }), []);
   const { logs, line, latex, error } = useLogs();
@@ -66,9 +68,41 @@ export default function PhasePlane() {
       const nodeY = math.parse(gy);
       // detect symbols -> params
       const syms = [...new Set([...symbolNames(nodeX), ...symbolNames(nodeY)])];
-      syms.forEach((k) => {
-        if (!(k in params)) setParams((p) => ({ ...p, [k]: 1 }));
-        if (!(k in paramDefs)) setParamDefs((d) => ({ ...d, [k]: { min: -3, max: 3, step: 0.1 } }));
+      const sortedSyms = [...syms].sort();
+      setRequiredParams(sortedSyms);
+      setParams((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        sortedSyms.forEach((k) => {
+          if (!(k in next) || !Number.isFinite(next[k])) {
+            next[k] = 1;
+            changed = true;
+          }
+        });
+        Object.keys(next).forEach((k) => {
+          if (!sortedSyms.includes(k)) {
+            delete next[k];
+            changed = true;
+          }
+        });
+        return changed ? next : prev;
+      });
+      setParamDefs((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        sortedSyms.forEach((k) => {
+          if (!(k in next)) {
+            next[k] = { min: -3, max: 3, step: 0.1 };
+            changed = true;
+          }
+        });
+        Object.keys(next).forEach((k) => {
+          if (!sortedSyms.includes(k)) {
+            delete next[k];
+            changed = true;
+          }
+        });
+        return changed ? next : prev;
       });
       const compiledX = nodeX.compile();
       const compiledY = nodeY.compile();
@@ -77,7 +111,7 @@ export default function PhasePlane() {
       const dfxdy = math.derivative(nodeX, "y").compile();
       const dfgdx = math.derivative(nodeY, "x").compile();
       const dfgdy = math.derivative(nodeY, "y").compile();
-
+  
       setCompiled({ nodeX, nodeY, compiledX, compiledY });
       setDx({ dfxdx, dfxdy });
       setDy({ dfgdx, dfgdy });
@@ -139,6 +173,17 @@ export default function PhasePlane() {
     const ctx = canvas.getContext("2d");
     const w = canvas.width;
     const h = canvas.height;
+
+    const paramsReady =
+      compiled &&
+      dx &&
+      dy &&
+      requiredParams.every((k) => Number.isFinite(params[k]));
+    if (!paramsReady) {
+      ctx.clearRect(0, 0, w, h);
+      return;
+    }
+
     ctx.clearRect(0, 0, w, h);
 
     const { xMin, xMax, yMin, yMax } = domain;
@@ -202,44 +247,47 @@ export default function PhasePlane() {
     ctx.stroke();
     ctx.restore();
 
-    // nullclines via coarse sampling & contour-ish lines
+    const approxEqual = (p, q) => Math.hypot(p[0] - q[0], p[1] - q[1]) < 1e-6;
+    const pointKey = (p) => `${Math.round(p[0] * 1e6)}:${Math.round(p[1] * 1e6)}`;
     const buildPolylines = (segments) => {
       const polylines = [];
       const used = new Array(segments.length).fill(false);
-      const key = (p) => `${Math.round(p[0] * 1e6)}:${Math.round(p[1] * 1e6)}`;
       const adjacency = new Map();
       segments.forEach((seg, idx) => {
         const [a, b] = seg;
-        const ka = key(a);
-        const kb = key(b);
+        const ka = pointKey(a);
+        const kb = pointKey(b);
         if (!adjacency.has(ka)) adjacency.set(ka, []);
         if (!adjacency.has(kb)) adjacency.set(kb, []);
-        adjacency.get(ka).push({ idx, other: b });
-        adjacency.get(kb).push({ idx, other: a });
+        adjacency.get(ka).push(idx);
+        adjacency.get(kb).push(idx);
       });
 
-      const takeNext = (point, forward, polyline) => {
+      const extend = (startPoint, forward, polyline) => {
+        let current = startPoint;
         while (true) {
-          const k = key(point);
-          const opts = adjacency.get(k) || [];
-          let chosen = null;
-          for (const opt of opts) {
-            if (!used[opt.idx]) {
-              chosen = opt;
+          const opts = adjacency.get(pointKey(current)) || [];
+          let foundIdx = -1;
+          let nextPoint = null;
+          for (const idx of opts) {
+            if (used[idx]) continue;
+            const [p0, p1] = segments[idx];
+            if (approxEqual(current, p0)) {
+              foundIdx = idx;
+              nextPoint = p1;
+              break;
+            }
+            if (approxEqual(current, p1)) {
+              foundIdx = idx;
+              nextPoint = p0;
               break;
             }
           }
-          if (!chosen) break;
-          used[chosen.idx] = true;
-          const seg = segments[chosen.idx];
-          const nextPoint = Math.hypot(seg[0][0] - point[0], seg[0][1] - point[1]) < 1e-8 ? seg[1] : seg[0];
-          if (forward) {
-            polyline.push(nextPoint);
-            point = nextPoint;
-          } else {
-            polyline.unshift(nextPoint);
-            point = nextPoint;
-          }
+          if (foundIdx === -1 || !nextPoint) break;
+          used[foundIdx] = true;
+          if (forward) polyline.push(nextPoint);
+          else polyline.unshift(nextPoint);
+          current = nextPoint;
         }
       };
 
@@ -247,8 +295,8 @@ export default function PhasePlane() {
         if (used[idx]) return;
         used[idx] = true;
         const polyline = [seg[0], seg[1]];
-        takeNext(polyline[polyline.length - 1], true, polyline);
-        takeNext(polyline[0], false, polyline);
+        extend(polyline[polyline.length - 1], true, polyline);
+        extend(polyline[0], false, polyline);
         polylines.push(polyline);
       });
 
@@ -256,7 +304,7 @@ export default function PhasePlane() {
     };
 
     function drawNullcline(which = "f") {
-      const M = 120;
+      const M = Math.max(80, Math.min(200, Math.floor(gridN * 2.5)));
       const values = new Array(M + 1);
       const dxCell = (xMax - xMin) / M;
       const dyCell = (yMax - yMin) / M;
@@ -282,28 +330,28 @@ export default function PhasePlane() {
             const v0 = values[i][j];
             const v1 = values[i + 1][j];
             const denom = v0 - v1;
-            const t = Math.abs(denom) < valEps ? 0.5 : v0 / denom;
+            const t = clamp(Math.abs(denom) < valEps ? 0.5 : v0 / denom, 0, 1);
             return [lerp(x0, x1, t), y0];
           }
           case 1: { // right
             const v0 = values[i + 1][j];
             const v1 = values[i + 1][j + 1];
             const denom = v0 - v1;
-            const t = Math.abs(denom) < valEps ? 0.5 : v0 / denom;
+            const t = clamp(Math.abs(denom) < valEps ? 0.5 : v0 / denom, 0, 1);
             return [x1, lerp(y0, y1, t)];
           }
           case 2: { // top
             const v0 = values[i][j + 1];
             const v1 = values[i + 1][j + 1];
             const denom = v0 - v1;
-            const t = Math.abs(denom) < valEps ? 0.5 : v0 / denom;
+            const t = clamp(Math.abs(denom) < valEps ? 0.5 : v0 / denom, 0, 1);
             return [lerp(x0, x1, t), y1];
           }
           case 3: { // left
             const v0 = values[i][j];
             const v1 = values[i][j + 1];
             const denom = v0 - v1;
-            const t = Math.abs(denom) < valEps ? 0.5 : v0 / denom;
+            const t = clamp(Math.abs(denom) < valEps ? 0.5 : v0 / denom, 0, 1);
             return [x0, lerp(y0, y1, t)];
           }
           default:
@@ -313,7 +361,7 @@ export default function PhasePlane() {
 
       const crosses = (a, b) => {
         if (!isFinite(a) || !isFinite(b)) return false;
-        if (Math.abs(a) < valEps && Math.abs(b) < valEps) return false;
+        if (Math.abs(a) < valEps && Math.abs(b) < valEps) return true; // treat edge-on-zero as crossing
         if (Math.abs(a) < valEps || Math.abs(b) < valEps) return true;
         return a * b < 0;
       };
@@ -329,36 +377,62 @@ export default function PhasePlane() {
           if (crosses(c10, c11)) pts.push({ edge: 1, point: edgePoint(i, j, 1) });
           if (crosses(c01, c11)) pts.push({ edge: 2, point: edgePoint(i, j, 2) });
           if (crosses(c00, c01)) pts.push({ edge: 3, point: edgePoint(i, j, 3) });
-          if (pts.length === 2) {
-            segments.push([pts[0].point, pts[1].point]);
-          } else if (pts.length === 4) {
+          if (pts.length === 0) continue;
+          const counts = new Map();
+          const uniquePts = [];
+          for (const entry of pts) {
+            const key = pointKey(entry.point);
+            counts.set(key, (counts.get(key) ?? 0) + 1);
+            if (!uniquePts.some((u) => approxEqual(u.point, entry.point))) {
+              uniquePts.push({ ...entry, key });
+            }
+          }
+          if (uniquePts.length === 2) {
+            segments.push([uniquePts[0].point, uniquePts[1].point]);
+          } else if (uniquePts.length === 3) {
+            const hub = uniquePts.find((u) => (counts.get(u.key) ?? 0) > 1);
+            if (hub) {
+              uniquePts.forEach((u) => {
+                if (u === hub) return;
+                segments.push([hub.point, u.point]);
+              });
+            } else {
+              uniquePts
+                .sort((a, b) => a.edge - b.edge)
+                .reduce((prev, curr) => {
+                  if (prev) segments.push([prev.point, curr.point]);
+                  return curr;
+                }, null);
+            }
+          } else if (uniquePts.length === 4) {
             const xc = xMin + (i + 0.5) * dxCell;
             const yc = yMin + (j + 0.5) * dyCell;
             const [uf, vf] = evalFG(xc, yc);
             const centerVal = which === "f" ? uf : vf;
-            pts.sort((a, b) => a.edge - b.edge);
+            const ordered = uniquePts.slice().sort((a, b) => a.edge - b.edge);
             if (centerVal > 0) {
-              segments.push([pts[0].point, pts[1].point]);
-              segments.push([pts[2].point, pts[3].point]);
+              segments.push([ordered[0].point, ordered[1].point]);
+              segments.push([ordered[2].point, ordered[3].point]);
             } else {
-              segments.push([pts[0].point, pts[3].point]);
-              segments.push([pts[1].point, pts[2].point]);
+              segments.push([ordered[0].point, ordered[3].point]);
+              segments.push([ordered[1].point, ordered[2].point]);
             }
           }
         }
       }
-
       const polylines = buildPolylines(segments);
 
       ctx.save();
-      ctx.lineWidth = 1.5;
+      ctx.lineWidth = 1.6;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
       ctx.strokeStyle = which === "f" ? "#22d3ee" : "#f472b6";
-      for (const poly of polylines) {
-        if (poly.length < 2) continue;
+      for (const polyline of polylines) {
+        if (polyline.length < 2) continue;
         ctx.beginPath();
-        poly.forEach(([x, y], idx) => {
-          const px = x2px(x);
-          const py = y2px(y);
+        polyline.forEach(([lx, ly], idx) => {
+          const px = x2px(lx);
+          const py = y2px(ly);
           if (idx === 0) ctx.moveTo(px, py);
           else ctx.lineTo(px, py);
         });
@@ -366,7 +440,7 @@ export default function PhasePlane() {
       }
       ctx.restore();
 
-      return { segments, polylines };
+      return segments;
     }
 
     const nullclineF = drawNullcline("f");
@@ -386,8 +460,8 @@ export default function PhasePlane() {
       return [a0[0] + t * r0[0], a0[1] + t * r0[1]];
     };
 
-    for (const segF of nullclineF.segments) {
-      for (const segG of nullclineG.segments) {
+    for (const segF of nullclineF) {
+      for (const segG of nullclineG) {
         const pt = segmentIntersect(segF[0], segF[1], segG[0], segG[1]);
         if (pt) intersections.push(pt);
       }
@@ -422,16 +496,24 @@ export default function PhasePlane() {
       }
     }
 
-    setFixedPoints((prev) => {
-      if (
-        prev.length === refinedPoints.length &&
-        refinedPoints.every((p) => prev.some((q) => Math.hypot(p[0] - q[0], p[1] - q[1]) < 1e-5))
-      ) {
-        return prev;
+    // Also seed from a coarse near-zero |F| grid and refine (captures vertex/edge zeros like (0,0))
+    {
+      const Mseed = 36;
+      for (let i = 0; i <= Mseed; i++) {
+        for (let j = 0; j <= Mseed; j++) {
+          const x = lerp(xMin, xMax, i / Mseed);
+          const y = lerp(yMin, yMax, j / Mseed);
+          const [u, v] = evalFG(x, y);
+          if (!isFinite(u) || !isFinite(v)) continue;
+          if (Math.hypot(u, v) < 1e-2) {
+            const refined = refinePoint(x, y);
+            if (refined && !refinedPoints.some((q) => Math.hypot(q[0] - refined[0], q[1] - refined[1]) < 1e-4)) {
+              refinedPoints.push(refined);
+            }
+          }
+        }
       }
-      return refinedPoints;
-    });
-
+    }
     ctx.save();
     ctx.fillStyle = "#fef08a";
     ctx.strokeStyle = "#f59e0b";
@@ -444,6 +526,64 @@ export default function PhasePlane() {
       ctx.stroke();
     }
     ctx.restore();
+
+    const sortedParams = Object.keys(params)
+      .sort()
+      .map((k) => `${k}:${Number(params[k]).toFixed(3)}`)
+      .join("|");
+    const signature = `${exprX}|${exprY}|${sortedParams}|${refinedPoints
+      .map((p) => `${p[0].toFixed(4)},${p[1].toFixed(4)}`)
+      .join("|")}`;
+    const nowReport = performance.now?.() ?? Date.now();
+    if (signature !== lastReportStateRef.current || nowReport - lastReportRef.current > 500) {
+      lastReportStateRef.current = signature;
+      lastReportRef.current = nowReport;
+      if (compiled) {
+        const fTex = compiled.nodeX.toTex();
+        const gTex = compiled.nodeY.toTex();
+        latex(`\\text{Nullclines: }\\; f(x,y)=0:\\; ${fTex}=0\\quad g(x,y)=0:\\; ${gTex}=0`);
+      }
+      if (refinedPoints.length === 0) {
+        latex(`\\text{Fixed points: none detected in domain.}`);
+      } else {
+        const fmtPt = (x, y) => `(${x.toFixed(3)},\\;${y.toFixed(3)})`;
+        latex(
+          `\\text{Fixed points (approx): } ${refinedPoints
+            .map((p, i) => `P_{${i + 1}}=${fmtPt(p[0], p[1])}`)
+            .join(",\\;")}`
+        );
+        const classify = (tr, det, disc) => {
+          if (!isFinite(tr) || !isFinite(det)) return "indeterminate";
+          if (Math.abs(det) < 1e-10) return "degenerate";
+          if (det < 0) return "saddle";
+          if (disc < 0) return Math.abs(tr) < 1e-6 ? "center" : tr < 0 ? "spiral sink" : "spiral source";
+          if (disc > 0) return tr < 0 ? "node sink" : "node source";
+          return tr < 0 ? "degenerate sink" : "degenerate source";
+        };
+        for (const [x, y] of refinedPoints) {
+          const J = jacobianAt(x, y);
+          const tr = J[0][0] + J[1][1];
+          const det = J[0][0] * J[1][1] - J[0][1] * J[1][0];
+          const disc = tr * tr - 4 * det;
+          const cls = classify(tr, det, disc);
+          const stability = cls.includes("sink") || cls === "center" ? (cls === "center" ? "neutral" : "stable") : cls === "saddle" ? "unstable" : tr > 0 ? "unstable" : "stable";
+          if (disc >= 0) {
+            const l1 = 0.5 * (tr + Math.sqrt(Math.max(0, disc)));
+            const l2 = 0.5 * (tr - Math.sqrt(Math.max(0, disc)));
+            latex(
+              `\\text{At } ${fmtPt(x, y)}:\\; J=\\begin{pmatrix}${J[0][0].toFixed(3)}&${J[0][1].toFixed(3)}\\\\${J[1][0].toFixed(3)}&${J[1][1].toFixed(3)}\\end{pmatrix},\\; \\\\ \\mathrm{tr}=${tr.toFixed(3)},\\; \\det=${det.toFixed(3)},\\; \\lambda_{1,2}=${l1
+                .toFixed(3)}\\;${l2.toFixed(3)}\\;,\\; \\text{class: ${cls} (${stability})}`
+            );
+          } else {
+            const re = 0.5 * tr;
+            const im = 0.5 * Math.sqrt(-disc);
+            latex(
+              `\\text{At } ${fmtPt(x, y)}:\\; J=\\begin{pmatrix}${J[0][0].toFixed(3)}&${J[0][1].toFixed(3)}\\\\${J[1][0].toFixed(3)}&${J[1][1].toFixed(3)}\\end{pmatrix},\\; \\\\ \\mathrm{tr}=${tr.toFixed(3)},\\; \\det=${det.toFixed(3)},\\; \\lambda=${re.toFixed(3)}\\pm ${im.toFixed(3)}i\\;,\\; \\text{class: ${cls} (${stability})}`
+            );
+          }
+        }
+      }
+    }
 
     // trajectories
     function integrate(x0, y0, dir = +1, steps = 2000, hstep = 0.01) {
@@ -510,7 +650,7 @@ export default function PhasePlane() {
     };
     canvas.addEventListener("click", onClick);
     return () => canvas.removeEventListener("click", onClick);
-  }, [compiled, params, domain, gridN, seeds, anim, dx, dy, evalFG, jacobianAt]);
+  }, [compiled, params, domain, gridN, seeds, anim, dx, dy, evalFG, jacobianAt, requiredParams, exprX, exprY, latex]);
 
   // Console command handler
   const onCommand = (s) => {
@@ -544,36 +684,6 @@ export default function PhasePlane() {
     }
     line("unknown command (help)");
   };
-
-  // Fixed points (coarse) + Jacobian report (in console)
-  React.useEffect(() => {
-    if (!compiled || !dx || !dy) return;
-    if (anim?.enabled) return; // skip verbose logging during animation
-    const fTex = compiled.nodeX.toTex();
-    const gTex = compiled.nodeY.toTex();
-    latex(`\\text{Nullclines: }\\; f(x,y)=0:\\; ${fTex}=0\\quad g(x,y)=0:\\; ${gTex}=0`);
-    if (fixedPoints.length === 0) {
-      latex(`\\text{Fixed points: none detected in domain.}`);
-      return;
-    }
-    latex(`\\text{Fixed points (approx): } ${fixedPoints.map((p) => `(${p[0].toFixed(3)},\\;${p[1].toFixed(3)})`).join(",\\;")}`);
-    for (const [x, y] of fixedPoints) {
-      const J = jacobianAt(x, y);
-      const tr = J[0][0] + J[1][1];
-      const det = J[0][0] * J[1][1] - J[0][1] * J[1][0];
-      const disc = tr * tr - 4 * det;
-      if (disc >= 0) {
-        const l1 = 0.5 * (tr + Math.sqrt(disc));
-        const l2 = 0.5 * (tr - Math.sqrt(disc));
-        latex(`J(${x.toFixed(3)},${y.toFixed(3)})=\\begin{pmatrix}${J[0][0].toFixed(3)}&${J[0][1].toFixed(3)}\\\\${J[1][0].toFixed(3)}&${J[1][1].toFixed(3)}\\end{pmatrix},\\; \\operatorname{tr}=${tr.toFixed(3)},\\; \\det=${det.toFixed(3)},\\; \\lambda_{1,2}=${l1.toFixed(3)},\\;${l2.toFixed(3)}`);
-      } else {
-        const re = 0.5 * tr;
-        const im = 0.5 * Math.sqrt(-disc);
-        latex(`J(${x.toFixed(3)},${y.toFixed(3)})=\\begin{pmatrix}${J[0][0].toFixed(3)}&${J[0][1].toFixed(3)}\\\\${J[1][0].toFixed(3)}&${J[1][1].toFixed(3)}\\end{pmatrix},\\; \\operatorname{tr}=${tr.toFixed(3)},\\; \\det=${det.toFixed(3)},\\; \\lambda= ${re.toFixed(3)}\\pm ${im.toFixed(3)}i`);
-      }
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [compiled, dx, dy, anim, fixedPoints, jacobianAt, latex]);
 
   // UI
 
