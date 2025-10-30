@@ -1,711 +1,596 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React from "react";
+import "katex/dist/katex.min.css";
+import { create, all } from "mathjs";
+import ConsolePanel from "./components/ConsolePanel";
 
-// External CDNs (loaded dynamically) for math parsing and LaTeX rendering
-// math.js: robust expression parsing (https://mathjs.org)
-// KaTeX: fast LaTeX rendering (https://katex.org)
+// Lightweight canvas-based phase portrait with param sliders + terminal console.
+// Focus: param detection (mu or μ), KaTeX console (no spam), nullclines, vector field, click-to-trace.
 
-const loadScript = (src) =>
-  new Promise((resolve, reject) => {
-    if (document.querySelector(`script[src="${src}"]`)) return resolve();
-    const s = document.createElement("script");
-    s.src = src;
-    s.async = true;
-    s.onload = resolve;
-    s.onerror = reject;
-    document.head.appendChild(s);
-  });
+const math = create(all, {});
+const RESERVED = new Set(["x", "y", "t", "e", "pi"]);
+const toAscii = (s) => s.replace(/\u03BC/g, "mu"); // map Greek μ -> mu
 
-const ensureDeps = async () => {
-  // Load math.js and KaTeX once
-  await loadScript("https://cdn.jsdelivr.net/npm/mathjs@11/lib/browser/math.js");
-  await loadScript("https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js");
-  await loadScript("https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js");
-  // Load KaTeX CSS
-  if (!document.getElementById("katex-css")) {
-    const link = document.createElement("link");
-    link.id = "katex-css";
-    link.rel = "stylesheet";
-    link.href = "https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css";
-    document.head.appendChild(link);
+function symbolNames(node) {
+  const out = new Set();
+  if (node?.traverse) {
+    node.traverse((n) => {
+      if (n.isSymbolNode && !RESERVED.has(n.name)) out.add(n.name);
+    });
   }
-};
+  return Array.from(out);
+}
 
-// ---------- Utilities ----------
-const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+function useLogs() {
+  const [logs, setLogs] = React.useState([]);
+  const push = (type, text) =>
+    setLogs((L) => {
+      const last = L[L.length - 1];
+      if (last && last.type === type && last.text === text) return L; // de-dupe consecutive
+      return [...L.slice(-400), { type, text, ts: Date.now() }];
+    });
+  const line = (t) => push("text", t);
+  const latex = (t) => push("latex", t);
+  const error = (t) => push("text", `Error: ${t}`);
+  return { logs, line, latex, error };
+}
+
+// Simple numeric helpers
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const lerp = (a, b, t) => a + (b - a) * t;
-const nearlyEqual = (a, b, eps = 1e-8) => Math.abs(a - b) < eps;
 
-function rk4Step(f, y, h) {
-  // y is [x, y], f returns [dxdt, dydt]
-  const k1 = f(y);
-  const k2 = f([y[0] + 0.5 * h * k1[0], y[1] + 0.5 * h * k1[1]]);
-  const k3 = f([y[0] + 0.5 * h * k2[0], y[1] + 0.5 * h * k2[1]]);
-  const k4 = f([y[0] + h * k3[0], y[1] + h * k3[1]]);
-  return [
-    y[0] + (h / 6) * (k1[0] + 2 * k2[0] + 2 * k3[0] + k4[0]),
-    y[1] + (h / 6) * (k1[1] + 2 * k2[1] + 2 * k3[1] + k4[1])
-  ];
-}
-
-function numericJacobian(F, p, h = 1e-4) {
-  const [x, y] = p;
-  const f0 = F([x, y]);
-  const fx = F([x + h, y]);
-  const fy = F([x, y + h]);
-  return [
-    [(fx[0] - f0[0]) / h, (fy[0] - f0[0]) / h],
-    [(fx[1] - f0[1]) / h, (fy[1] - f0[1]) / h]
-  ];
-}
-
-function eigenDecomp2x2(A) {
-  const a = A[0][0], b = A[0][1], c = A[1][0], d = A[1][1];
-  const tr = a + d;
-  const det = a * d - b * c;
-  const disc = tr * tr - 4 * det;
-  if (disc < 0) {
-    // complex eigenvalues -> spiral/center; return null vectors
-    const real = tr / 2;
-    const imag = Math.sqrt(-disc) / 2;
-    return { type: "complex", eigenvalues: [real, imag], eigenvectors: [] };
-  } else {
-    const rdisc = Math.sqrt(disc);
-    const l1 = (tr + rdisc) / 2;
-    const l2 = (tr - rdisc) / 2;
-    const v1 = Math.abs(b) > 1e-12 ? [l1 - d, b] : [c, l1 - a];
-    const v2 = Math.abs(b) > 1e-12 ? [l2 - d, b] : [c, l2 - a];
-    const norm = (v) => {
-      const m = Math.hypot(v[0], v[1]) || 1;
-      return [v[0] / m, v[1] / m];
-    };
-    return { type: "real", eigenvalues: [l1, l2], eigenvectors: [norm(v1), norm(v2)] };
-  }
-}
-
-function uniquePoints(points, tol = 0.05) {
-  const out = [];
-  points.forEach((p) => {
-    if (!out.some((q) => Math.hypot(p[0] - q[0], p[1] - q[1]) < tol)) out.push(p);
-  });
-  return out;
-}
-
-// ---------- Main Component ----------
 export default function PhasePlane() {
-  const canvasRef = useRef(null);
-  const overlayRef = useRef(null);
-  const consoleRef = useRef(null);
-  const [depsReady, setDepsReady] = useState(false);
+  // Inputs
+  const [exprX, setExprX] = React.useState("mu*x - x^2 - y");
+  const [exprY, setExprY] = React.useState("x + mu*y - y^3");
+  const [domain, setDomain] = React.useState({ xMin: -3, xMax: 3, yMin: -3, yMax: 3 });
+  const [gridN, setGrid] = React.useState(40);
+  const [params, setParams] = React.useState({});
+  const [paramDefs, setParamDefs] = React.useState({});
+  const [compiled, setCompiled] = React.useState(null);
+  const [dx, setDx] = React.useState(null); // derivatives
+  const [dy, setDy] = React.useState(null);
+  const [anim, setAnim] = React.useState({ enabled: false, key: null, speed: 0.4, min: -3, max: 3 });
+  const [seeds, setSeeds] = React.useState([]); // trajectory seeds
+  const canvasRef = React.useRef(null);
 
-  const [exprX, setExprX] = useState("y");
-  const [exprY, setExprY] = useState("x - x^3");
+  const scopeBase = React.useMemo(() => ({ t: 0, e: Math.E, pi: Math.PI }), []);
+  const { logs, line, latex, error } = useLogs();
 
-  const [domain, setDomain] = useState({ xMin: -2.5, xMax: 2.5, yMin: -2.0, yMax: 2.0 });
-  const [vfOpacity, setVfOpacity] = useState(0.25);
-  const [grid, setGrid] = useState(22);
-
-  const [trajectories, setTrajectories] = useState([]); // array of {pts: [[x,y],...], color}
-  const [separatrices, setSeparatrices] = useState([]); // computed from saddles
-  const [fixedPoints, setFixedPoints] = useState([]); // {p:[x,y], eig}
-  const [nullclinePts, setNullclinePts] = useState({ f: [], g: [] });
-
-  const [busy, setBusy] = useState(false);
-
-  // Load external libs once
-  useEffect(() => {
-    (async () => {
-      try {
-        await ensureDeps();
-        setDepsReady(true);
-        renderConsoleLatex();
-      } catch (e) {
-        console.error("Dependency load error", e);
-      }
-    })();
-  }, []);
-
-  // Build evaluators using math.js
-  const evalFns = useMemo(() => {
-    if (!depsReady || !window.math) return null;
+  // Parse & compile when exprs change
+  React.useEffect(() => {
     try {
-      const parserX = window.math.parse(exprX);
-      const parserY = window.math.parse(exprY);
-      const f = ({ x, y }) => {
-        const scope = { x, y, t: 0, e: Math.E, pi: Math.PI };
-        return parserX.evaluate(scope);
-      };
-      const g = ({ x, y }) => {
-        const scope = { x, y, t: 0, e: Math.E, pi: Math.PI };
-        return parserY.evaluate(scope);
-      };
-      return { f, g };
+      const fx = toAscii(exprX);
+      const gy = toAscii(exprY);
+      const nodeX = math.parse(fx);
+      const nodeY = math.parse(gy);
+      // detect symbols -> params
+      const syms = [...new Set([...symbolNames(nodeX), ...symbolNames(nodeY)])];
+      syms.forEach((k) => {
+        if (!(k in params)) setParams((p) => ({ ...p, [k]: 1 }));
+        if (!(k in paramDefs)) setParamDefs((d) => ({ ...d, [k]: { min: -3, max: 3, step: 0.1 } }));
+      });
+      const compiledX = nodeX.compile();
+      const compiledY = nodeY.compile();
+      // derivatives w.r.t x,y for Jacobian & Newton
+      const dfxdx = math.derivative(nodeX, "x").compile();
+      const dfxdy = math.derivative(nodeX, "y").compile();
+      const dfgdx = math.derivative(nodeY, "x").compile();
+      const dfgdy = math.derivative(nodeY, "y").compile();
+
+      setCompiled({ nodeX, nodeY, compiledX, compiledY });
+      setDx({ dfxdx, dfxdy });
+      setDy({ dfgdx, dfgdy });
+      latex(`\\text{Parsed } f=${nodeX.toTex()}\\;,\\; g=${nodeY.toTex()}`);
     } catch (e) {
-      return null;
+      setCompiled(null);
+      setDx(null);
+      setDy(null);
+      error(e.message);
     }
-  }, [depsReady, exprX, exprY]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [exprX, exprY]);
 
-  const F = useMemo(() => {
-    if (!evalFns) return null;
-    return ([x, y]) => [evalFns.f({ x, y }), evalFns.g({ x, y })];
-  }, [evalFns]);
+  const evalFG = React.useCallback((x, y, t = 0) => {
+    if (!compiled) return [0, 0];
+    try {
+      const scope = { ...scopeBase, x, y, t, ...params };
+      return [Number(compiled.compiledX.evaluate(scope)), Number(compiled.compiledY.evaluate(scope))];
+    } catch {
+      return [NaN, NaN];
+    }
+  }, [compiled, params, scopeBase]);
 
-  // Coordinate transforms
-  const toCanvas = (x, y, canvas) => {
+  const jacobianAt = React.useCallback((x, y) => {
+    if (!dx || !dy) return [[0, 0], [0, 0]];
+    const scope = { ...scopeBase, x, y, ...params };
+    const a = Number(dx.dfxdx.evaluate(scope));
+    const b = Number(dx.dfxdy.evaluate(scope));
+    const c = Number(dy.dfgdx.evaluate(scope));
+    const d = Number(dy.dfgdy.evaluate(scope));
+    return [[a, b], [c, d]];
+  }, [dx, dy, params, scopeBase]);
+
+  // Parameter animation
+  React.useEffect(() => {
+    if (!anim.enabled || !anim.key) return;
+    let raf = 0,
+      last = performance.now();
+    const { min, max, speed } = anim;
+    const span = (max - min) || 1;
+    const tick = (now) => {
+      const dt = (now - last) / 1000;
+      last = now;
+      setParams((p) => {
+        const cur = (p[anim.key] ?? 0) + speed * dt * span;
+        let v = min + (((cur - min) % span) + span) % span; // wrap
+        return { ...p, [anim.key]: v };
+      });
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [anim]);
+
+  // Draw vector field + nullclines + seeds
+  React.useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const w = canvas.width;
+    const h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+
     const { xMin, xMax, yMin, yMax } = domain;
-    const w = canvas.width, h = canvas.height;
-    const cx = ((x - xMin) / (xMax - xMin)) * w;
-    const cy = h - ((y - yMin) / (yMax - yMin)) * h;
-    return [cx, cy];
-  };
+    const x2px = (x) => ((x - xMin) / (xMax - xMin)) * w;
+    const y2px = (y) => (1 - (y - yMin) / (yMax - yMin)) * h;
+    const px2x = (px) => (px / w) * (xMax - xMin) + xMin;
+    const px2y = (py) => (1 - py / h) * (yMax - yMin) + yMin;
 
-  const toWorld = (cx, cy, canvas) => {
-    const { xMin, xMax, yMin, yMax } = domain;
-    const w = canvas.width, h = canvas.height;
-    const x = xMin + (cx / w) * (xMax - xMin);
-    const y = yMin + ((h - cy) / h) * (yMax - yMin);
-    return [x, y];
-  };
-
-  // Draw axes, background, labels
-  const drawScaffold = (ctx) => {
-    const { xMin, xMax, yMin, yMax } = domain;
-    const w = ctx.canvas.width, h = ctx.canvas.height;
-
-    // gradient background
-    const grad = ctx.createLinearGradient(0, 0, w, h);
-    grad.addColorStop(0, "#0f172a");
-    grad.addColorStop(1, "#1e293b");
-    ctx.fillStyle = grad;
-    ctx.fillRect(0, 0, w, h);
-
-    // axes
+    // vector field
+    const N = gridN;
     ctx.save();
-    ctx.globalAlpha = 0.7;
-    ctx.strokeStyle = "#94a3b8";
-    ctx.lineWidth = 1.5;
-
-    const [cx0, cy0] = toCanvas(0, 0, ctx.canvas);
-    // x-axis
-    if (yMin < 0 && yMax > 0) {
-      ctx.beginPath();
-      ctx.moveTo(0, cy0);
-      ctx.lineTo(w, cy0);
-      ctx.stroke();
-    }
-    // y-axis
-    if (xMin < 0 && xMax > 0) {
-      ctx.beginPath();
-      ctx.moveTo(cx0, 0);
-      ctx.lineTo(cx0, h);
-      ctx.stroke();
-    }
-
-    // ticks
-    ctx.globalAlpha = 0.4;
-    ctx.lineWidth = 1;
-    const xtick = niceStep(xMin, xMax);
-    for (let x = Math.ceil(xMin / xtick) * xtick; x <= xMax; x += xtick) {
-      const [cx] = toCanvas(x, 0, ctx.canvas);
-      ctx.beginPath();
-      ctx.moveTo(cx, 0);
-      ctx.lineTo(cx, h);
-      ctx.stroke();
-    }
-    const ytick = niceStep(yMin, yMax);
-    for (let y = Math.ceil(yMin / ytick) * ytick; y <= yMax; y += ytick) {
-      const [, cy] = toCanvas(0, y, ctx.canvas);
-      ctx.beginPath();
-      ctx.moveTo(0, cy);
-      ctx.lineTo(w, cy);
-      ctx.stroke();
-    }
-    ctx.restore();
-  };
-
-  const niceStep = (min, max) => {
-    const span = Math.abs(max - min);
-    const raw = span / 8;
-    const pow = Math.pow(10, Math.floor(Math.log10(raw)));
-    const steps = [1, 2, 5, 10].map((k) => k * pow);
-    return steps.reduce((a, b) => (Math.abs(raw - a) < Math.abs(raw - b) ? a : b));
-  };
-
-  const drawVectorField = (ctx) => {
-    if (!F) return;
-    const w = ctx.canvas.width, h = ctx.canvas.height;
-    ctx.save();
-    ctx.globalAlpha = vfOpacity;
-    ctx.strokeStyle = "#e2e8f0";
-    ctx.lineWidth = 1;
-
-    for (let i = 0; i < grid; i++) {
-      for (let j = 0; j < grid; j++) {
-        const x = lerp(domain.xMin, domain.xMax, (i + 0.5) / grid);
-        const y = lerp(domain.yMin, domain.yMax, (j + 0.5) / grid);
-        const v = F([x, y]);
-        const m = Math.hypot(v[0], v[1]);
-        if (m === 0) continue;
-        const scale = 0.18 * Math.min((domain.xMax - domain.xMin) / grid, (domain.yMax - domain.yMin) / grid);
-        const dx = (v[0] / m) * scale;
-        const dy = (v[1] / m) * scale;
-        const [cx1, cy1] = toCanvas(x - dx, y - dy, ctx.canvas);
-        const [cx2, cy2] = toCanvas(x + dx, y + dy, ctx.canvas);
+    ctx.globalAlpha = 0.35;
+    for (let i = 0; i < N; i++) {
+      for (let j = 0; j < N; j++) {
+        const x = lerp(xMin, xMax, i / (N - 1));
+        const y = lerp(yMin, yMax, j / (N - 1));
+        const [u, v] = evalFG(x, y);
+        if (!isFinite(u) || !isFinite(v)) continue;
+        const m = Math.hypot(u, v) || 1e-6;
+        const scale = 0.6 * Math.min(w, h) / (N * 4);
+        const dxv = (u / m) * scale;
+        const dyv = (v / m) * scale;
+        const px = x2px(x);
+        const py = y2px(y);
+        // arrow
         ctx.beginPath();
-        ctx.moveTo(cx1, cy1);
-        ctx.lineTo(cx2, cy2);
+        ctx.moveTo(px - dxv, py - dyv);
+        ctx.lineTo(px + dxv, py + dyv);
+        ctx.strokeStyle = "#94a3b8";
+        ctx.lineWidth = 1.2;
         ctx.stroke();
-
-        // arrowhead
-        const angle = Math.atan2(cy2 - cy1, cx2 - cx1);
-        const ah = 5;
+        // head
+        const ang = Math.atan2(dyv, dxv);
+        const head = 3;
         ctx.beginPath();
-        ctx.moveTo(cx2, cy2);
-        ctx.lineTo(cx2 - ah * Math.cos(angle - Math.PI / 6), cy2 - ah * Math.sin(angle - Math.PI / 6));
-        ctx.lineTo(cx2 - ah * Math.cos(angle + Math.PI / 6), cy2 - ah * Math.sin(angle + Math.PI / 6));
+        ctx.moveTo(px + dxv, py + dyv);
+        ctx.lineTo(px + dxv - head * Math.cos(ang - Math.PI / 6), py + dyv - head * Math.sin(ang - Math.PI / 6));
+        ctx.lineTo(px + dxv - head * Math.cos(ang + Math.PI / 6), py + dyv - head * Math.sin(ang + Math.PI / 6));
         ctx.closePath();
-        ctx.fillStyle = "#e2e8f0";
+        ctx.fillStyle = "#94a3b8";
         ctx.fill();
       }
     }
-
     ctx.restore();
-  };
 
-  // Compute nullclines and fixed points
-  const recomputeStructure = async () => {
-    if (!F || !evalFns) return;
-    setBusy(true);
-    appendLatex("\\textbf{Recomputing structure...}");
-
-    // sample grid
-    const NX = 100, NY = 100;
-    const fPts = [];
-    const gPts = [];
-    const fpCandidates = [];
-    for (let i = 0; i <= NX; i++) {
-      const x = lerp(domain.xMin, domain.xMax, i / NX);
-      for (let j = 0; j <= NY; j++) {
-        const y = lerp(domain.yMin, domain.yMax, j / NY);
-        const [fx, gy] = [evalFns.f({ x, y }), evalFns.g({ x, y })];
-        if (Math.abs(fx) < 0.02) fPts.push([x, y]);
-        if (Math.abs(gy) < 0.02) gPts.push([x, y]);
-      }
-    }
-    setNullclinePts({ f: fPts, g: gPts });
-    appendLatex("\\text{Nullclines: plotted points where }|f|,|g|<0.02.");
-
-    // Find fixed points by sign changes of both on coarse grid cells
-    const FP = [];
-    const nx = 24, ny = 24;
-    for (let i = 0; i < nx; i++) {
-      for (let j = 0; j < ny; j++) {
-        const x0 = lerp(domain.xMin, domain.xMax, i / nx);
-        const x1 = lerp(domain.xMin, domain.xMax, (i + 1) / nx);
-        const y0 = lerp(domain.yMin, domain.yMax, j / ny);
-        const y1 = lerp(domain.yMin, domain.yMax, (j + 1) / ny);
-        const corners = [
-          [x0, y0],
-          [x1, y0],
-          [x0, y1],
-          [x1, y1]
-        ];
-        const vals = corners.map(([x, y]) => [evalFns.f({ x, y }), evalFns.g({ x, y })]);
-        const fsigns = vals.map((v) => Math.sign(v[0]));
-        const gsigns = vals.map((v) => Math.sign(v[1]));
-        const fvar = new Set(fsigns).size > 1;
-        const gvar = new Set(gsigns).size > 1;
-        if (fvar && gvar) {
-          fpCandidates.push([(x0 + x1) / 2, (y0 + y1) / 2]);
-        }
-      }
-    }
-
-    // Refine candidates via small Newton steps
-    const newton = (p0) => {
-      let p = p0.slice();
-      for (let k = 0; k < 25; k++) {
-        const J = numericJacobian(F, p);
-        const Fp = F(p);
-        const det = J[0][0] * J[1][1] - J[0][1] * J[1][0];
-        if (Math.abs(det) < 1e-10) break;
-        // Solve J * dp = -F
-        const inv = [
-          [J[1][1] / det, -J[0][1] / det],
-          [-J[1][0] / det, J[0][0] / det]
-        ];
-        const dp = [
-          -(inv[0][0] * Fp[0] + inv[0][1] * Fp[1]),
-          -(inv[1][0] * Fp[0] + inv[1][1] * Fp[1])
-        ];
-        p = [p[0] + dp[0], p[1] + dp[1]];
-        if (Math.hypot(dp[0], dp[1]) < 1e-8) break;
-      }
-      return p;
-    };
-
-    let fps = uniquePoints(fpCandidates.map(newton), 0.05);
-
-    const detailed = fps.map((p) => {
-      const J = numericJacobian(F, p);
-      const E = eigenDecomp2x2(J);
-      return { p, J, E };
-    });
-
-    setFixedPoints(detailed);
-    appendLatex(
-      `\\text{Found }${detailed.length}\\ \text{ fixed points. Linearization eigenvalues }` +
-        detailed
-          .map(({ p, E }, i) =>
-            E.type === "real"
-              ? `\\lambda=(${fmt(E.eigenvalues[0])},${fmt(E.eigenvalues[1])}) \\text{ at } (x,y)=(${fmt(
-                  p[0]
-                )},${fmt(p[1])})`
-              : `\\lambda= ${fmt(E.eigenvalues[0])} \pm i${fmt(E.eigenvalues[1])} \\text{ at } (x,y)=(${fmt(
-                  p[0]
-                )},${fmt(p[1])})`
-          )
-          .join("; ")
-    );
-
-    // Separatrices: for saddles (real eigenvalues with opposite signs)
-    const seps = [];
-    detailed.forEach(({ p, E }) => {
-      if (E.type === "real") {
-        const s1 = Math.sign(E.eigenvalues[0]);
-        const s2 = Math.sign(E.eigenvalues[1]);
-        if (s1 * s2 < 0) {
-          // saddle
-          const dirs = E.eigenvectors;
-          const mags = [
-            0.006 * (domain.xMax - domain.xMin),
-            0.006 * (domain.yMax - domain.yMin)
-          ];
-          [1, -1].forEach((sgn) => {
-            dirs.forEach((v) => {
-              const p0 = [p[0] + sgn * v[0] * mags[0], p[1] + sgn * v[1] * mags[1]];
-              const fwd = integratePath(p0, 400, 0.004, +1);
-              const bwd = integratePath(p0, 400, 0.004, -1);
-              seps.push({ pts: [...bwd.reverse(), ...fwd], color: "#fbbf24" });
-            });
-          });
-        }
-      }
-    });
-    setSeparatrices(seps);
-    appendLatex("\\text{Separatrices integrated from eigen-directions at saddle points.}");
-
-    setBusy(false);
-    renderScene();
-    renderConsoleLatex();
-  };
-
-  const fmt = (x) => (Math.abs(x) < 1e-4 ? "0" : x.toFixed(3));
-
-  const integratePath = (p0, steps, h, dir = +1) => {
-    const pts = [p0];
-    let p = p0.slice();
-    for (let i = 0; i < steps; i++) {
-      p = rk4Step(F, p, dir * h);
-      // stop if out of bounds or NaN
-      if (
-        !isFinite(p[0]) ||
-        !isFinite(p[1]) ||
-        p[0] < domain.xMin - 1 ||
-        p[0] > domain.xMax + 1 ||
-        p[1] < domain.yMin - 1 ||
-        p[1] > domain.yMax + 1
-      )
-        break;
-      pts.push(p);
-    }
-    return pts;
-  };
-
-  const drawDots = (ctx, pts, color, size = 2) => {
+    // axes
     ctx.save();
-    ctx.fillStyle = color;
-    pts.forEach(([x, y]) => {
-      const [cx, cy] = toCanvas(x, y, ctx.canvas);
-      ctx.beginPath();
-      ctx.arc(cx, cy, size, 0, Math.PI * 2);
-      ctx.fill();
-    });
-    ctx.restore();
-  };
-
-  const drawPath = (ctx, pts, color, width = 2, arrowEvery = 30) => {
-    if (pts.length < 2) return;
-    ctx.save();
-    ctx.strokeStyle = color;
-    ctx.lineWidth = width;
+    ctx.strokeStyle = "#475569";
+    ctx.lineWidth = 1;
+    // x-axis
+    const y0 = y2px(0);
     ctx.beginPath();
-    let [cx, cy] = toCanvas(pts[0][0], pts[0][1], ctx.canvas);
-    ctx.moveTo(cx, cy);
-    for (let i = 1; i < pts.length; i++) {
-      [cx, cy] = toCanvas(pts[i][0], pts[i][1], ctx.canvas);
-      ctx.lineTo(cx, cy);
-    }
+    ctx.moveTo(0, y0);
+    ctx.lineTo(w, y0);
     ctx.stroke();
-
-    // direction arrows
-    for (let i = arrowEvery; i < pts.length; i += arrowEvery) {
-      const p1 = pts[i - 1];
-      const p2 = pts[i];
-      const [c1x, c1y] = toCanvas(p1[0], p1[1], ctx.canvas);
-      const [c2x, c2y] = toCanvas(p2[0], p2[1], ctx.canvas);
-      const ang = Math.atan2(c2y - c1y, c2x - c1x);
-      const ah = 7;
-      ctx.beginPath();
-      ctx.moveTo(c2x, c2y);
-      ctx.lineTo(c2x - ah * Math.cos(ang - Math.PI / 6), c2y - ah * Math.sin(ang - Math.PI / 6));
-      ctx.lineTo(c2x - ah * Math.cos(ang + Math.PI / 6), c2y - ah * Math.sin(ang + Math.PI / 6));
-      ctx.closePath();
-      ctx.fillStyle = color;
-      ctx.fill();
-    }
+    // y-axis
+    const x0 = x2px(0);
+    ctx.beginPath();
+    ctx.moveTo(x0, 0);
+    ctx.lineTo(x0, h);
+    ctx.stroke();
     ctx.restore();
-  };
 
-  const draw = () => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.floor(canvas.clientWidth * dpr);
-    canvas.height = Math.floor(canvas.clientHeight * dpr);
+    // nullclines via coarse sampling & contour-ish lines
+    function drawNullcline(which = "f") {
+      const M = 120;
+      ctx.save();
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = which === "f" ? "#22d3ee" : "#f472b6";
+      // marching squares-ish: sample and connect zero-crossings in a grid
+      const vals = new Array(M + 1);
+      for (let i = 0; i <= M; i++) {
+        vals[i] = new Array(M + 1);
+        for (let j = 0; j <= M; j++) {
+          const x = lerp(xMin, xMax, i / M);
+          const y = lerp(yMin, yMax, j / M);
+          const [u, v] = evalFG(x, y);
+          vals[i][j] = which === "f" ? u : v;
+        }
+      }
+      const eps = (xMax - xMin + yMax - yMin) / 400;
+      for (let i = 0; i < M; i++) {
+        for (let j = 0; j < M; j++) {
+          // check if sign changes across cell edges
+          const c00 = vals[i][j], c10 = vals[i+1][j], c01 = vals[i][j+1], c11 = vals[i+1][j+1];
+          const hasZero =
+            Math.sign(c00) !== Math.sign(c10) ||
+            Math.sign(c00) !== Math.sign(c01) ||
+            Math.sign(c11) !== Math.sign(c10) ||
+            Math.sign(c11) !== Math.sign(c01) ||
+            Math.abs(c00) < eps || Math.abs(c10) < eps || Math.abs(c01) < eps || Math.abs(c11) < eps;
+          if (hasZero) {
+            // draw cell outline in light color
+            const xA = x2px(lerp(xMin, xMax, i / M));
+            const yA = y2px(lerp(yMin, yMax, j / M));
+            const xB = x2px(lerp(xMin, xMax, (i + 1) / M));
+            const yB = y2px(lerp(yMin, yMax, (j + 1) / M));
+            ctx.beginPath();
+            ctx.moveTo(xA, yA);
+            ctx.lineTo(xB, yA);
+            ctx.lineTo(xB, yB);
+            ctx.lineTo(xA, yB);
+            ctx.closePath();
+            ctx.stroke();
+          }
+        }
+      }
+      ctx.restore();
+    }
 
-    const ctx = canvas.getContext("2d");
-    drawScaffold(ctx);
-    drawVectorField(ctx);
-
-    // nullclines
-    drawDots(ctx, nullclinePts.f, "#60a5fa", 1.8); // f=0 blue
-    drawDots(ctx, nullclinePts.g, "#34d399", 1.8); // g=0 green
-
-    // separatrices
-    separatrices.forEach((s) => drawPath(ctx, s.pts, s.color, 2.5, 28));
+    drawNullcline("f");
+    drawNullcline("g");
 
     // trajectories
-    trajectories.forEach((t) => drawPath(ctx, t.pts, t.color, 2.5, 22));
-
-    // fixed points
-    fixedPoints.forEach(({ p, E }) => {
-      const color = E.type === "real" ? (Math.sign(E.eigenvalues[0]) * Math.sign(E.eigenvalues[1]) < 0 ? "#f87171" : "#a78bfa") : "#38bdf8";
-      drawDots(ctx, [p], color, 4);
-    });
-
-    // overlay axes labels
-    const overlay = overlayRef.current;
-    if (!overlay) return;
-    overlay.innerHTML = `x ∈ [${domain.xMin}, ${domain.xMax}], y ∈ [${domain.yMin}, ${domain.yMax}]`;
-  };
-
-  const renderScene = () => {
-    requestAnimationFrame(draw);
-  };
-
-  // Re-render when data changes
-  useEffect(() => {
-    renderScene();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [vfOpacity, grid, domain, nullclinePts, separatrices, trajectories, fixedPoints, F]);
-
-  // Recompute structure when bounds change (after user commits)
-  useEffect(() => {
-    if (F) {
-      recomputeStructure();
+    function integrate(x0, y0, dir = +1, steps = 2000, hstep = 0.01) {
+      let x = x0, y = y0;
+      const pts = [];
+      for (let k = 0; k < steps; k++) {
+        const [u, v] = evalFG(x, y);
+        if (!isFinite(u) || !isFinite(v)) break;
+        // RK2 (midpoint) for a bit more stability
+        const mx = x + 0.5 * dir * hstep * u;
+        const my = y + 0.5 * dir * hstep * v;
+        const [uu, vv] = evalFG(mx, my);
+        x += dir * hstep * uu;
+        y += dir * hstep * vv;
+        if (x < xMin - 1 || x > xMax + 1 || y < yMin - 1 || y > yMax + 1) break;
+        pts.push([x, y]);
+      }
+      return pts;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [domain.xMin, domain.xMax, domain.yMin, domain.yMax, F]);
 
-  const addTrajectoryFrom = (p0) => {
-    if (!F) return;
-    appendLatex(`\\text{Integrating trajectory from }(${fmt(p0[0])},${fmt(p0[1])})`);
-    const fwd = integratePath(p0, 1500, 0.01, +1);
-    const bwd = integratePath(p0, 1500, 0.01, -1);
-    const path = [...bwd.reverse(), ...fwd];
-    const hue = Math.floor(200 + 80 * Math.random());
-    const color = `hsl(${hue} 90% 70%)`;
-    setTrajectories((T) => [...T, { pts: path, color }]);
-  };
+    ctx.save();
+    ctx.lineWidth = 2;
+    seeds.forEach((s) => {
+      // forward
+      let pts = integrate(s[0], s[1], +1, 800, 0.01);
+      // backward
+      const ptsB = integrate(s[0], s[1], -1, 800, 0.01).reverse();
+      pts = ptsB.concat([[s[0], s[1]]], pts);
+      // draw with arrows along
+      ctx.strokeStyle = "#eab308";
+      ctx.beginPath();
+      for (let i = 0; i < pts.length; i++) {
+        const [x, y] = pts[i];
+        const px = x2px(x), py = y2px(y);
+        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+      // arrowheads sparsely
+      for (let i = 15; i < pts.length; i += 25) {
+        const [x1, y1] = pts[i - 1];
+        const [x2, y2] = pts[i];
+        const ang = Math.atan2(y2 - y1, x2 - x1);
+        const px = x2px(x2), py = y2px(y2);
+        const head = 4;
+        ctx.beginPath();
+        ctx.moveTo(px, py);
+        ctx.lineTo(px - head * Math.cos(ang - Math.PI / 6), py - head * Math.sin(ang - Math.PI / 6));
+        ctx.lineTo(px - head * Math.cos(ang + Math.PI / 6), py - head * Math.sin(ang + Math.PI / 6));
+        ctx.closePath();
+        ctx.fillStyle = "#eab308";
+        ctx.fill();
+      }
+    });
+    ctx.restore();
 
-  // Handle clicks to seed trajectories
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const onClick = (e) => {
+    // pointer handler
+    const onClick = (evt) => {
       const rect = canvas.getBoundingClientRect();
-      const cx = e.clientX - rect.left;
-      const cy = e.clientY - rect.top;
-      const [x, y] = toWorld(cx * (canvas.width / canvas.clientWidth), cy * (canvas.height / canvas.clientHeight), canvas);
-      addTrajectoryFrom([x, y]);
+      const px = evt.clientX - rect.left;
+      const py = evt.clientY - rect.top;
+      const x = px2x(px);
+      const y = px2y(py);
+      setSeeds((S) => [...S, [x, y]]);
     };
     canvas.addEventListener("click", onClick);
     return () => canvas.removeEventListener("click", onClick);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [F, domain]);
+  }, [compiled, params, domain, gridN, seeds, anim, dx, dy, evalFG]);
 
-  const reset = () => {
-    setTrajectories([]);
-    setSeparatrices([]);
-    setFixedPoints([]);
-    setNullclinePts({ f: [], g: [] });
-  };
-
-  // ---------- LaTeX Console ----------
-  const [consoleLines, setConsoleLines] = useState([]);
-  const appendLatex = (line) => setConsoleLines((L) => [...L, line]);
-  const clearConsole = () => setConsoleLines([]);
-  const renderConsoleLatex = () => {
-    const el = consoleRef.current;
-    if (!el || !window.renderMathInElement) return;
-    // escape HTML then insert spans with data-latex
-    el.innerHTML = consoleLines
-      .map((s) => `<div class=\"py-0.5\">$${s}$</div>`)
-      .join("");
-    window.renderMathInElement(el, { delimiters: [{ left: "$", right: "$", display: false }] });
-    el.scrollTop = el.scrollHeight;
-  };
-
-  useEffect(() => {
-    renderConsoleLatex();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [consoleLines, depsReady]);
-
-  const handleRun = async () => {
-    if (!depsReady) return;
-    clearConsole();
-    appendLatex("\\textbf{Parsing } f(x,y)=" + window.katex.renderToString(exprX) + ",\\quad g(x,y)=" + window.katex.renderToString(exprY));
-    await new Promise((r) => setTimeout(r, 50));
-    appendLatex("\\text{Building vector field and nullclines...}");
-    reset();
-    await new Promise((r) => setTimeout(r, 10));
-    await recomputeStructure();
-  };
-
-  const randomSeeds = () => {
-    for (let k = 0; k < 6; k++) {
-      const x = lerp(domain.xMin, domain.xMax, Math.random());
-      const y = lerp(domain.yMin, domain.yMax, Math.random());
-      addTrajectoryFrom([x, y]);
+  // Console command handler
+  const onCommand = (s) => {
+    const [c, ...rest] = s.trim().split(/\s+/);
+    if (c === "help") {
+      return line("commands: set <param> <value> | grid <N> | bounds xMin xMax yMin yMax | clear");
     }
-  };
-
-  return (
-    <div className="w-full h-full min-h-[720px] bg-slate-900 text-slate-100">
-      <div className="max-w-7xl mx-auto p-4 space-y-4">
-        <header className="flex flex-col md:flex-row md:items-end md:justify-between gap-3">
-          <div>
-            <h1 className="text-2xl md:text-3xl font-semibold tracking-tight">Interactive Phase Plane</h1>
-            <p className="text-slate-300 text-sm">Click in the plane to seed trajectories. f = ẋ, g = ẏ. Nullclines: f=0 (blue), g=0 (green). Fixed points: saddle (red), node/focus (violet/cyan). Separatrices in amber.</p>
-          </div>
-          <div className="flex gap-2">
-            <button onClick={handleRun} className="px-4 py-2 rounded-2xl bg-sky-600 hover:bg-sky-500 shadow">Run</button>
-            <button onClick={() => { reset(); renderScene(); }} className="px-4 py-2 rounded-2xl bg-slate-700 hover:bg-slate-600">Clear</button>
-            <button onClick={randomSeeds} className="px-4 py-2 rounded-2xl bg-emerald-600 hover:bg-emerald-500">Seed</button>
-          </div>
-        </header>
-
-        <section className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-          <div className="lg:col-span-2 space-y-3">
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-2 min-w-0">
-              <div className="bg-slate-800/60 rounded-2xl p-3 min-w-0">
-                <label className="text-sm text-slate-300">ẋ = f(x,y)</label>
-                <input value={exprX} onChange={(e) => setExprX(e.target.value)} className="w-full mt-1 rounded-xl bg-slate-900/60 border border-slate-700 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-sky-500" placeholder="e.g. y" />
-              </div>
-              <div className="bg-slate-800/60 rounded-2xl p-3 min-w-0">
-                <label className="text-sm text-slate-300">ẏ = g(x,y)</label>
-                <input value={exprY} onChange={(e) => setExprY(e.target.value)} className="w-full mt-1 rounded-xl bg-slate-900/60 border border-slate-700 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-sky-500" placeholder="e.g. x - x^3" />
-              </div>
-            </div>
-
-            <div className="grid grid-cols-2 md:grid-cols-6 gap-2">
-              <NumBox label="xMin" v={domain.xMin} set={(x)=>setDomain(d=>({...d,xMin:parseFloat(x)}))} />
-              <NumBox label="xMax" v={domain.xMax} set={(x)=>setDomain(d=>({...d,xMax:parseFloat(x)}))} />
-              <NumBox label="yMin" v={domain.yMin} set={(x)=>setDomain(d=>({...d,yMin:parseFloat(x)}))} />
-              <NumBox label="yMax" v={domain.yMax} set={(x)=>setDomain(d=>({...d,yMax:parseFloat(x)}))} />
-              <NumBox label="Grid" v={grid} set={(x)=>setGrid(parseInt(x||"20"))} />
-              <NumBox label="VF α" v={vfOpacity} step={0.05} set={(x)=>setVfOpacity(parseFloat(x))} />
-            </div>
-
-            <div className="relative w-full h-[520px] rounded-3xl shadow-inner overflow-hidden border border-slate-800">
-              <canvas ref={canvasRef} className="w-full h-full" />
-              <div ref={overlayRef} className="absolute bottom-2 right-3 text-xs text-slate-300 bg-slate-800/60 rounded-lg px-2 py-1" />
-            </div>
-          </div>
-
-          <div className="lg:col-span-1 flex flex-col gap-2">
-            <div className="bg-slate-800/60 rounded-2xl p-3 h-[220px] overflow-auto">
-              <h3 className="font-medium mb-2">Console (LaTeX)</h3>
-              <div ref={consoleRef} className="text-sm leading-relaxed break-words" />
-            </div>
-            <div className="bg-slate-800/60 rounded-2xl p-3 space-y-2">
-              <h3 className="font-medium">Quick Tips</h3>
-              <ul className="text-sm text-slate-300 list-disc pl-5 space-y-1">
-                <li>Click anywhere to add a trajectory (RK4 both directions).</li>
-                <li>Press <span className="text-sky-400">Run</span> after editing f, g or bounds.</li>
-                <li>Colors: f=0 <span className="text-sky-400">(blue)</span>, g=0 <span className="text-emerald-400">(green)</span>, saddles <span className="text-rose-400">(red)</span>, separatrices <span className="text-amber-400">(amber)</span>.</li>
-                <li>Use ^ for powers, e.g., <code>x^3 - y</code>. Functions: sin, cos, tanh, exp, etc.</li>
-              </ul>
-            </div>
-            <div className="bg-slate-800/60 rounded-2xl p-3">
-              <h3 className="font-medium mb-1">Examples</h3>
-              <div className="flex flex-wrap gap-2">
-                <ExampleButton setX={setExprX} setY={setExprY} fx="y" gy="x - x^3" label="Duffing-like" />
-                <ExampleButton setX={setExprX} setY={setExprY} fx="y - x" gy="x*(1 - x^2) - y" label="Van der Pol-ish" />
-                <ExampleButton setX={setExprX} setY={setExprY} fx="x - y" gy="x + y - x*(x^2 + y^2)" label="Spiral sink" />
-              </div>
-            </div>
-          </div>
-        </section>
-      </div>
-    </div>
-  );
-}
-
-function NumBox({ label, v, set, step }) {
-  const [txt, setTxt] = React.useState(String(v));
-  // keep local text in sync if parent changes
-  React.useEffect(() => setTxt(String(v)), [v]);
-
-  const commit = () => {
-    const num = Number(txt);
-    if (!Number.isFinite(num)) {
-      // revert to last valid
-      setTxt(String(v));
+    if (c === "clear") {
+      // clear logs
+      return window.location.reload();
+    }
+    if (c === "set" && rest.length === 2) {
+      const [name, val] = rest;
+      if (!(name in params)) return line(`unknown param "${name}"`);
+      const num = Number(val);
+      if (!Number.isFinite(num)) return line("value must be a number");
+      setParams((p) => ({ ...p, [name]: num }));
       return;
     }
-    set(num);
+    if (c === "grid" && rest.length === 1) {
+      const n = Number(rest[0]);
+      if (!Number.isInteger(n) || n < 8 || n > 200) return line("grid must be 8..200");
+      setGrid(n);
+      return;
+    }
+    if (c === "bounds" && rest.length === 4) {
+      const [a, b, c1, d] = rest.map(Number);
+      if ([a, b, c1, d].some((v) => !Number.isFinite(v)) || a >= b || c1 >= d) return line("bad bounds");
+      setDomain({ xMin: a, xMax: b, yMin: c1, yMax: d });
+      return;
+    }
+    line("unknown command (help)");
   };
 
-  return (
-    <label className="text-xs text-slate-300 bg-slate-800/60 rounded-xl px-3 py-2 flex items-center gap-2 min-w-0">
-      <span className="w-10 opacity-80">{label}</span>
-      <input
-        type="text"
-        inputMode="decimal"
-        step={step ?? 0.1}
-        value={txt}
-        onChange={(e) => setTxt(e.target.value)}
-        onBlur={commit}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter') commit();
-        }}
-        className="flex-1 min-w-0 rounded-lg bg-slate-900/60 border border-slate-700 px-2 py-1 focus:outline-none focus:ring-2 focus:ring-sky-500"
-      />
-    </label>
-  );
-}
+  // Fixed points (coarse) + Jacobian report (in console)
+  React.useEffect(() => {
+    if (!compiled || !dx || !dy) return;
+    if (anim?.enabled) return; // skip verbose logging during animation
+    const { xMin, xMax, yMin, yMax } = domain;
+    // coarse scan for near zeros
+    const M = 30;
+    const near = [];
+    for (let i = 0; i <= M; i++) {
+      for (let j = 0; j <= M; j++) {
+        const x = lerp(xMin, xMax, i / M);
+        const y = lerp(yMin, yMax, j / M);
+        const [u, v] = evalFG(x, y);
+        if (!isFinite(u) || !isFinite(v)) continue;
+        const m = Math.hypot(u, v);
+        if (m < 1e-2) near.push([x, y]);
+      }
+    }
+    // unique cluster
+    const uniq = [];
+    for (const p of near) {
+      if (!uniq.some((q) => Math.hypot(p[0] - q[0], p[1] - q[1]) < 0.2)) uniq.push(p);
+    }
+    // Newton refine
+    const refined = [];
+    for (const [x0, y0] of uniq) {
+      let x = x0, y = y0;
+      for (let it = 0; it < 20; it++) {
+        const [u, v] = evalFG(x, y);
+        const J = jacobianAt(x, y);
+        const det = J[0][0] * J[1][1] - J[0][1] * J[1][0];
+        if (Math.abs(det) < 1e-8) break;
+        // solve J * delta = -F
+        const dxn = (-u * J[1][1] + v * J[0][1]) / det;
+        const dyn = (-v * J[0][0] + u * J[1][0]) / det;
+        x += dxn; y += dyn;
+        if (Math.hypot(dxn, dyn) < 1e-6) break;
+      }
+      if (isFinite(x) && isFinite(y)) refined.push([x, y]);
+    }
+    // unique again tighter
+    const fixed = [];
+    for (const p of refined) {
+      if (!fixed.some((q) => Math.hypot(p[0] - q[0], p[1] - q[1]) < 1e-3)) fixed.push(p);
+    }
 
-function ExampleButton({ label, fx, gy, setX, setY }) {
+    // Report
+    const fTex = compiled.nodeX.toTex();
+    const gTex = compiled.nodeY.toTex();
+    latex(`\\text{Nullclines: }\\; f(x,y)=0:\\; ${fTex}=0\\quad g(x,y)=0:\\; ${gTex}=0`);
+    if (fixed.length === 0) {
+      latex(`\\text{Fixed points: none detected in domain.}`);
+      return;
+    }
+    latex(`\\text{Fixed points (approx): } ${fixed.map((p) => `(${p[0].toFixed(3)},\\;${p[1].toFixed(3)})`).join(",\\;")}`);
+    for (const [x, y] of fixed) {
+      const J = jacobianAt(x, y);
+      const tr = J[0][0] + J[1][1];
+      const det = J[0][0] * J[1][1] - J[0][1] * J[1][0];
+      const disc = tr * tr - 4 * det;
+      if (disc >= 0) {
+        const l1 = 0.5 * (tr + Math.sqrt(disc));
+        const l2 = 0.5 * (tr - Math.sqrt(disc));
+        latex(`J(${x.toFixed(3)},${y.toFixed(3)})=\\begin{pmatrix}${J[0][0].toFixed(3)}&${J[0][1].toFixed(3)}\\\\${J[1][0].toFixed(3)}&${J[1][1].toFixed(3)}\\end{pmatrix},\\; \\operatorname{tr}=${tr.toFixed(3)},\\; \\det=${det.toFixed(3)},\\; \\lambda_{1,2}=${l1.toFixed(3)},\\;${l2.toFixed(3)}`);
+      } else {
+        const re = 0.5 * tr;
+        const im = 0.5 * Math.sqrt(-disc);
+        latex(`J(${x.toFixed(3)},${y.toFixed(3)})=\\begin{pmatrix}${J[0][0].toFixed(3)}&${J[0][1].toFixed(3)}\\\\${J[1][0].toFixed(3)}&${J[1][1].toFixed(3)}\\end{pmatrix},\\; \\operatorname{tr}=${tr.toFixed(3)},\\; \\det=${det.toFixed(3)},\\; \\lambda= ${re.toFixed(3)}\\pm ${im.toFixed(3)}i`);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [compiled, params, domain, evalFG, jacobianAt]);
+
+  // UI
+
   return (
-    <button
-      onClick={() => {
-        setX(fx);
-        setY(gy);
-      }}
-      className="text-xs px-2 py-1 rounded-lg bg-slate-700 hover:bg-slate-600"
-    >
-      {label}
-    </button>
+    <div className="bg-slate-900 text-slate-100 pt-4 px-4 pb-0">
+      <div className="max-w-7xl mx-auto grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div className="md:col-span-2 bg-slate-800/60 rounded-2xl p-3">
+          <div className="flex items-center justify-between mb-3 gap-2">
+            <div className="text-slate-200 font-semibold">Phase Plane</div>
+            <div className="text-xs text-slate-400">click canvas to add a trajectory seed</div>
+          </div>
+          <div className="relative">
+            <canvas ref={canvasRef} width={900} height={700} className="w-full rounded-xl bg-slate-950 border border-slate-700" />
+            <div className="absolute top-3 left-3 bg-slate-900/70 backdrop-blur-md rounded-lg px-3 py-2 text-xs border border-slate-700 flex flex-wrap items-center gap-3">
+              <div className="flex items-center gap-2">
+                <span>ẋ=</span>
+                <input
+                  className="w-56 bg-slate-900/60 rounded px-2 py-1 border border-slate-700"
+                  value={exprX}
+                  onChange={(e) => setExprX(e.target.value)}
+                />
+              </div>
+              <div className="flex items-center gap-2">
+                <span>ẏ=</span>
+                <input
+                  className="w-56 bg-slate-900/60 rounded px-2 py-1 border border-slate-700"
+                  value={exprY}
+                  onChange={(e) => setExprY(e.target.value)}
+                />
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="opacity-70">bounds</span>
+                <input
+                  title="xMin"
+                  className="w-16 bg-slate-900/60 rounded px-2 py-1 border border-slate-700"
+                  type="number"
+                  value={domain.xMin}
+                  onChange={(e) => setDomain((d) => ({ ...d, xMin: Number(e.target.value) }))}
+                />
+                <input
+                  title="xMax"
+                  className="w-16 bg-slate-900/60 rounded px-2 py-1 border border-slate-700"
+                  type="number"
+                  value={domain.xMax}
+                  onChange={(e) => setDomain((d) => ({ ...d, xMax: Number(e.target.value) }))}
+                />
+                <input
+                  title="yMin"
+                  className="w-16 bg-slate-900/60 rounded px-2 py-1 border border-slate-700"
+                  type="number"
+                  value={domain.yMin}
+                  onChange={(e) => setDomain((d) => ({ ...d, yMin: Number(e.target.value) }))}
+                />
+                <input
+                  title="yMax"
+                  className="w-16 bg-slate-900/60 rounded px-2 py-1 border border-slate-700"
+                  type="number"
+                  value={domain.yMax}
+                  onChange={(e) => setDomain((d) => ({ ...d, yMax: Number(e.target.value) }))}
+                />
+                <label className="text-xs text-slate-300">grid
+                  <input
+                    className="ml-2 w-20 bg-slate-900/60 rounded px-2 py-1 border border-slate-700"
+                    type="number"
+                    value={gridN}
+                    min={8}
+                    max={200}
+                    onChange={(e) => setGrid(clamp(Number(e.target.value)||40, 8, 200))}
+                  />
+                </label>
+                <button
+                  className="ml-2 px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 border border-slate-600"
+                  title="Add a random seed"
+                  onClick={() => {
+                    const x = lerp(domain.xMin, domain.xMax, Math.random());
+                    const y = lerp(domain.yMin, domain.yMax, Math.random());
+                    setSeeds((S) => [...S, [x, y]]);
+                  }}
+                >
+                  Seed
+                </button>
+                <button
+                  className="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 border border-slate-600"
+                  title="Clear seeds"
+                  onClick={() => setSeeds([])}
+                >
+                  Clear
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="md:col-span-1 space-y-4">
+          <div className="bg-slate-800/60 rounded-2xl p-3">
+            <div className="flex items-center justify-between">
+              <span className="text-sm text-slate-300 font-medium">Parameters</span>
+              <div className="flex items-center gap-2">
+                <label className="flex items-center gap-2 text-xs text-slate-300">
+                  <input
+                    type="checkbox"
+                    checked={anim.enabled}
+                    onChange={(e) => setAnim((a) => ({ ...a, enabled: e.target.checked }))}
+                  />
+                  Animate
+                </label>
+                <select
+                  className="text-xs bg-slate-900/60 rounded px-2 py-1 border border-slate-700"
+                  value={anim.key ?? ""}
+                  onChange={(e) => setAnim((a) => ({ ...a, key: e.target.value || null }))}
+                >
+                  <option value="">(param)</option>
+                  {Object.keys(params).map((k) => (
+                    <option key={k} value={k}>
+                      {k}
+                    </option>
+                  ))}
+                </select>
+                <label className="text-xs text-slate-300">
+                  speed
+                  <input
+                    className="ml-2 w-24 bg-slate-900/60 rounded px-2 py-1 border border-slate-700"
+                    type="number"
+                    step="0.1"
+                    value={anim.speed}
+                    onChange={(e) => setAnim((a) => ({ ...a, speed: Number(e.target.value) || 0 }))}
+                    disabled={!anim.key}
+                  />
+                </label>
+              </div>
+            </div>
+
+            <div className="mt-2 space-y-3">
+              {Object.keys(params).length === 0 && (
+                <div className="text-xs text-slate-400">
+                  No free parameters detected. Use symbols like <code>mu</code> or Greek <code>μ</code> in f,g.
+                </div>
+              )}
+              {Object.keys(params).map((k) => {
+                const def = paramDefs[k] ?? { min: -3, max: 3, step: 0.1 };
+                return (
+                  <div key={k} className="flex items-center gap-3">
+                    <div className="w-10 text-xs text-slate-300">{k}</div>
+                    <input
+                      className="flex-1"
+                      type="range"
+                      min={def.min}
+                      max={def.max}
+                      step={def.step}
+                      value={params[k]}
+                      onChange={(e) => setParams((p) => ({ ...p, [k]: Number(e.target.value) }))}
+                    />
+                    <input
+                      className="w-24 bg-slate-900/60 rounded px-2 py-1 border border-slate-700 text-sm"
+                      type="number"
+                      step={def.step}
+                      value={params[k]}
+                      onChange={(e) => setParams((p) => ({ ...p, [k]: Number(e.target.value) }))}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <ConsolePanel logs={logs} onCommand={onCommand} />
+        </div>
+      </div>
+    </div>
   );
 }
