@@ -1,5 +1,4 @@
 import React from "react";
-import "katex/dist/katex.min.css";
 import ConsolePanel from "./components/ConsolePanel";
 
 const lerp = (a, b, t) => a + (b - a) * t;
@@ -45,16 +44,22 @@ export default function PhasePlane() {
   const requestIdRef = React.useRef(0);
   const lastReportSigRef = React.useRef("");
   const lastStatusRef = React.useRef("");
+  const domainRef = React.useRef(defaultDomain);
+  const gridNRef = React.useRef(gridN);
+  const [viewportTick, setViewportTick] = React.useState(0);
+  const inflightRef = React.useRef(false);
+  const queuedPayloadRef = React.useRef(null);
+  const [workerReady, setWorkerReady] = React.useState(false);
 
   const { logs, line, latex, error, clear: clearLogs } = useLogs();
 
   React.useEffect(() => {
     const worker = new Worker(new URL("./workers/phaseWorker.js", import.meta.url));
     workerRef.current = worker;
+    setWorkerReady(true);
     worker.onmessage = (event) => {
       const { type, payload, requestId } = event.data || {};
       if (type !== "result") return;
-      if (requestId && requestId !== requestIdRef.current) return;
       const {
         status,
         requiredParams: req = [],
@@ -78,8 +83,8 @@ export default function PhasePlane() {
           nullclines: nullclines ?? { f: [], g: [] },
           equilibria: equilibria ?? [],
           trajectories: trajectories ?? [],
-          domain: domainResult ?? domain,
-          gridN: gridResult ?? gridN,
+          domain: domainResult ?? domainRef.current,
+          gridN: gridResult ?? gridNRef.current,
         });
       } else {
         setWorkerData(null);
@@ -109,11 +114,23 @@ export default function PhasePlane() {
         }
         lastStatusRef.current = statusSig;
       }
+
+      // mark complete and send any queued request
+      inflightRef.current = false;
+      const queued = queuedPayloadRef.current;
+      if (queued) {
+        queuedPayloadRef.current = null;
+        const nextId = requestIdRef.current + 1;
+        requestIdRef.current = nextId;
+        inflightRef.current = true;
+        worker.postMessage({ type: "compute", requestId: nextId, payload: queued });
+      }
     };
     worker.onerror = (evt) => {
       error(evt?.message || "Worker error");
     };
     return () => {
+      setWorkerReady(false);
       worker.terminate();
       workerRef.current = null;
     };
@@ -138,6 +155,14 @@ export default function PhasePlane() {
       return changed ? next : prev;
     });
   }, [requiredParams]);
+
+  React.useEffect(() => {
+    domainRef.current = domain;
+  }, [domain]);
+
+  React.useEffect(() => {
+    gridNRef.current = gridN;
+  }, [gridN]);
 
   React.useEffect(() => {
     setParamDefs((prev) => {
@@ -192,26 +217,74 @@ export default function PhasePlane() {
     setGridInput(String(gridN));
   }, [gridN]);
 
-  React.useEffect(() => {
+  const postCompute = React.useCallback((payload) => {
     const worker = workerRef.current;
     if (!worker) return;
+    if (inflightRef.current) {
+      queuedPayloadRef.current = payload;
+      return;
+    }
     const requestId = requestIdRef.current + 1;
     requestIdRef.current = requestId;
-    setWorkerData(null);
-    worker.postMessage({
-      type: "compute",
-      requestId,
-      payload: {
-        exprX,
-        exprY,
-        params,
-        domain,
-        gridN,
-        seeds,
-      },
-    });
-  }, [exprX, exprY, params, domain, gridN, seeds]);
+    inflightRef.current = true;
+    worker.postMessage({ type: "compute", requestId, payload });
+  }, []);
 
+  React.useEffect(() => {
+    if (!workerReady) return;
+    postCompute({ exprX, exprY, params, domain, gridN, seeds });
+  }, [exprX, exprY, params, domain, gridN, seeds, postCompute, workerReady]);
+
+  React.useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const resize = () => {
+      // Target CSS size: fill parent container width and height
+      const container = canvas.parentElement;
+      const containerRect = container?.getBoundingClientRect();
+      const cssWidth = Math.max(300, Math.floor(containerRect?.width || window.innerWidth));
+      const cssHeight = Math.max(300, Math.floor(containerRect?.height || window.innerHeight));
+
+      // Apply CSS size
+      canvas.style.width = cssWidth + "px";
+      canvas.style.height = cssHeight + "px";
+
+      // Backing store size (HiDPI-aware)
+      const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+      const desiredW = Math.floor(cssWidth * dpr);
+      const desiredH = Math.floor(cssHeight * dpr);
+      if (canvas.width !== desiredW) canvas.width = desiredW;
+      if (canvas.height !== desiredH) canvas.height = desiredH;
+
+      // Trigger a re-render of the canvas content
+      setViewportTick((t) => t + 1);
+    };
+    resize();
+    window.addEventListener("resize", resize);
+    return () => window.removeEventListener("resize", resize);
+  }, []);
+
+  // Redraw on DPR changes (zoom) as well
+  React.useEffect(() => {
+    let mql;
+    const handle = () => setViewportTick((t) => t + 1);
+    if (window.matchMedia) {
+      mql = window.matchMedia(`(resolution: ${Math.round((window.devicePixelRatio || 1) * 96)}dpi)`);
+      if (mql && typeof mql.addEventListener === "function") {
+        mql.addEventListener("change", handle);
+      } else if (mql && typeof mql.addListener === "function") {
+        mql.addListener(handle);
+      }
+    }
+    return () => {
+      if (!mql) return;
+      if (typeof mql.removeEventListener === "function") {
+        mql.removeEventListener("change", handle);
+      } else if (typeof mql.removeListener === "function") {
+        mql.removeListener(handle);
+      }
+    };
+  }, []);
   React.useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -335,7 +408,7 @@ export default function PhasePlane() {
       }
     });
     ctx.restore();
-  }, [workerData, domain]);
+  }, [workerData, domain, viewportTick]);
 
   React.useEffect(() => {
     const canvas = canvasRef.current;
@@ -344,8 +417,8 @@ export default function PhasePlane() {
       const rect = canvas.getBoundingClientRect();
       const px = evt.clientX - rect.left;
       const py = evt.clientY - rect.top;
-      const x = (px / canvas.width) * (domain.xMax - domain.xMin) + domain.xMin;
-      const y = (1 - py / canvas.height) * (domain.yMax - domain.yMin) + domain.yMin;
+      const x = (px / rect.width) * (domain.xMax - domain.xMin) + domain.xMin;
+      const y = (1 - py / rect.height) * (domain.yMax - domain.yMin) + domain.yMin;
       if (!Number.isFinite(x) || !Number.isFinite(y)) return;
       setSeeds((prev) => [...prev, [x, y]]);
     };
@@ -455,15 +528,15 @@ export default function PhasePlane() {
   };
 
   return (
-    <div className="bg-slate-900 text-slate-100 pt-4 px-4 pb-0">
-      <div className="max-w-7xl mx-auto grid grid-cols-1 md:grid-cols-3 gap-4">
-        <div className="md:col-span-2 bg-slate-800/60 rounded-2xl p-3">
+    <div className="bg-slate-900 text-slate-100 h-screen overflow-hidden pr-2 pt-2 pb-2">
+      <div className="w-full h-full grid grid-cols-1 md:[grid-template-columns:1fr_2fr] gap-3">
+        <div className="h-full flex flex-col md:order-2">
           <div className="flex items-center justify-between mb-3 gap-2">
             <div className="text-slate-200 font-semibold">Phase Plane</div>
             <div className="text-xs text-slate-400">click canvas to add a trajectory seed</div>
           </div>
-          <div className="relative">
-            <canvas ref={canvasRef} width={900} height={700} className="w-full rounded-xl bg-slate-950 border border-slate-700" />
+          <div className="relative flex-1">
+            <canvas ref={canvasRef} width={900} height={700} className="w-full h-full bg-slate-950" />
             <div className="absolute top-3 left-3 bg-slate-900/70 backdrop-blur-md rounded-lg px-3 py-2 text-xs border border-slate-700 flex flex-wrap items-center gap-3">
               <div className="flex items-center gap-2">
                 <span>ẋ=</span>
@@ -555,7 +628,7 @@ export default function PhasePlane() {
           </div>
         </div>
 
-        <div className="md:col-span-1 space-y-4">
+        <div className="md:col-span-1 space-y-4 h-full overflow-auto md:order-1">
           <div className="bg-slate-800/60 rounded-2xl p-3">
             <div className="flex items-center justify-between">
               <span className="text-sm text-slate-300 font-medium">Parameters</span>

@@ -15,11 +15,11 @@ Lightweight, canvas-based phase portrait explorer for 2D systems. Enter `ẋ = f
 - Bounds/Grid: adjust domain and field resolution in the toolbar overlay.
 - Seeds: click the canvas to drop a seed. Use the `Seed` button for a random seed and `Clear` to remove all.
 - Animate: check “Animate”, choose a parameter, and set speed to sweep the parameter value.
-- Console: shows KaTeX-rendered summaries. Commands:
+ - Console: shows KaTeX-rendered summaries. Commands:
   - `set <param> <value>`
   - `grid <N>` (8..200)
   - `bounds xMin xMax yMin yMax`
-  - `clear` (reloads to clear console)
+  - `clear` (clears console output)
 
 ## Notes
 

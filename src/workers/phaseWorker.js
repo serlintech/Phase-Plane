@@ -1,4 +1,10 @@
+/* eslint-env worker */
 import { create, all } from "mathjs";
+
+const workerScope = typeof self === "object" && self ? self : null;
+if (!workerScope || typeof workerScope.addEventListener !== "function" || typeof workerScope.postMessage !== "function") {
+  throw new Error("Phase worker running without a valid worker global scope.");
+}
 
 const math = create(all, {});
 const RESERVED = new Set(["x", "y", "t", "e", "pi"]);
@@ -310,7 +316,7 @@ function integrateTrajectory(compiled, params, domain, x0, y0, dir = +1, steps =
   return pts;
 }
 
-self.addEventListener("message", (event) => {
+workerScope.addEventListener("message", (event) => {
   const { type, payload, requestId } = event.data || {};
   if (type !== "compute") return;
 
@@ -332,7 +338,7 @@ self.addEventListener("message", (event) => {
     if (!domain) {
       result.status = "error";
       result.message = "Domain missing";
-      self.postMessage({ type: "result", payload: result, requestId });
+      workerScope.postMessage({ type: "result", payload: result, requestId });
       return;
     }
 
@@ -342,7 +348,7 @@ self.addEventListener("message", (event) => {
       result.message = "Invalid domain bounds";
       const compiled = getCompiled(exprX, exprY);
       result.requiredParams = compiled.requiredParams;
-      self.postMessage({ type: "result", payload: result, requestId });
+      workerScope.postMessage({ type: "result", payload: result, requestId });
       return;
     }
 
@@ -353,7 +359,7 @@ self.addEventListener("message", (event) => {
     if (missingParams.length > 0) {
       result.status = "missingParams";
       result.missingParams = missingParams;
-      self.postMessage({ type: "result", payload: result, requestId });
+      workerScope.postMessage({ type: "result", payload: result, requestId });
       return;
     }
 
@@ -503,5 +509,5 @@ self.addEventListener("message", (event) => {
     result.message = err?.message || String(err);
   }
 
-  self.postMessage({ type: "result", payload: result, requestId });
+  workerScope.postMessage({ type: "result", payload: result, requestId });
 });
