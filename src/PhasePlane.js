@@ -53,6 +53,7 @@ export default function PhasePlane() {
   const [workerReady, setWorkerReady] = React.useState(false);
   const isDraggingRef = React.useRef(false);
   const dragTimeoutRef = React.useRef(null);
+  const isPrecomputingRef = React.useRef(false);
 
   const { logs, line, latex, error, clear: clearLogs } = useLogs();
 
@@ -94,7 +95,7 @@ export default function PhasePlane() {
       }
 
       // Only update console if not dragging or during pre-compute (avoid spam)
-      if (newLogs.length && !isDraggingRef.current && !animCache.isPrecomputing) {
+      if (newLogs.length && !isDraggingRef.current && !isPrecomputingRef.current) {
         const signature = reportSignature || newLogs.map((entry) => `${entry.type}:${entry.text}`).join("|");
         if (signature !== lastReportSigRef.current) {
           lastReportSigRef.current = signature;
@@ -104,6 +105,9 @@ export default function PhasePlane() {
           });
         }
       }
+      
+      // Don't update canvas during pre-compute
+      if (isPrecomputingRef.current) return;
 
       const statusSig = `${status}|${message || ""}|${missingParams.join(",")}`;
       if (status === "ok") {
@@ -193,12 +197,12 @@ export default function PhasePlane() {
     const { key, min, max } = anim;
     if (!key || !workerRef.current) return;
     
+    isPrecomputingRef.current = true;
     setAnimCache(prev => ({ ...prev, isPrecomputing: true, progress: 0, frames: [] }));
     
     const numFrames = 120; // 2 seconds at 60fps for smooth playback
     const frames = [];
     const worker = workerRef.current;
-    const currentWorkerData = workerData; // Save current display
     
     for (let i = 0; i < numFrames; i++) {
       const t = i / (numFrames - 1);
@@ -250,15 +254,21 @@ export default function PhasePlane() {
       setAnimCache(prev => ({ ...prev, progress: ((i + 1) / numFrames) * 100 }));
     }
     
-    // Restore original display after pre-compute
-    setWorkerData(currentWorkerData);
+    // Mark complete and show first frame
+    isPrecomputingRef.current = false;
     setAnimCache(prev => ({ ...prev, frames, isPrecomputing: false, progress: 100, currentFrame: 0 }));
-  }, [anim, exprX, exprY, params, domain, gridN, seeds, workerData]);
+    
+    // Display the first frame immediately
+    if (frames.length > 0) {
+      setWorkerData(frames[0].data);
+    }
+  }, [anim, exprX, exprY, params, domain, gridN, seeds]);
 
   // Re-integrate trajectories into existing animation cache
   const reintegrateTrajectories = React.useCallback(async () => {
     if (animCache.frames.length === 0 || !workerRef.current) return;
     
+    isPrecomputingRef.current = true;
     setAnimCache(prev => ({ ...prev, isPrecomputing: true, progress: 0 }));
     const worker = workerRef.current;
     const updatedFrames = [...animCache.frames];
@@ -308,8 +318,15 @@ export default function PhasePlane() {
       setAnimCache(prev => ({ ...prev, progress: ((i + 1) / updatedFrames.length) * 100 }));
     }
     
+    isPrecomputingRef.current = false;
     setAnimCache(prev => ({ ...prev, frames: updatedFrames, isPrecomputing: false, progress: 100 }));
-  }, [animCache.frames, anim.key, exprX, exprY, params, domain, gridN, seeds]);
+    
+    // Show updated frame
+    const currentFrame = animCache.currentFrame;
+    if (updatedFrames[currentFrame]) {
+      setWorkerData(updatedFrames[currentFrame].data);
+    }
+  }, [animCache.frames, animCache.currentFrame, anim.key, exprX, exprY, params, domain, gridN, seeds]);
 
   // Smooth playback of pre-computed frames
   React.useEffect(() => {
