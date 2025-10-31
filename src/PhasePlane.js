@@ -50,7 +50,6 @@ export default function PhasePlane() {
   const inflightRef = React.useRef(false);
   const queuedPayloadRef = React.useRef(null);
   const [workerReady, setWorkerReady] = React.useState(false);
-  const lastComputeTimeRef = React.useRef(0);
 
   const { logs, line, latex, error, clear: clearLogs } = useLogs();
 
@@ -188,17 +187,29 @@ export default function PhasePlane() {
   React.useEffect(() => {
     if (!anim.enabled || !anim.key) return;
     let raf = 0;
-    let last = performance.now();
+    let lastUpdate = performance.now();
     const { min, max, speed, key } = anim;
     const span = max - min || 1;
+    
+    // Adaptive frame time: slower speeds = less frequent updates for same smoothness
+    // At speed 0.4: ~20fps, at speed 0.05: ~10fps, at speed 0.01: ~5fps
+    const getFrameTime = (spd) => {
+      const baseTime = 50; // 20fps baseline
+      return Math.max(baseTime, baseTime * (0.4 / Math.max(0.01, Math.abs(spd))));
+    };
+    
     const tick = (now) => {
-      const dt = (now - last) / 1000;
-      last = now;
-      setParams((prev) => {
-        const cur = (prev[key] ?? 0) + speed * dt * span;
-        const wrapped = min + (((cur - min) % span) + span) % span;
-        return { ...prev, [key]: wrapped };
-      });
+      const minFrameTime = getFrameTime(speed);
+      // Only update params if enough time has passed
+      if (now - lastUpdate >= minFrameTime) {
+        const dt = (now - lastUpdate) / 1000;
+        lastUpdate = now;
+        setParams((prev) => {
+          const cur = (prev[key] ?? 0) + speed * dt * span;
+          const wrapped = min + (((cur - min) % span) + span) % span;
+          return { ...prev, [key]: wrapped };
+        });
+      }
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
@@ -220,25 +231,13 @@ export default function PhasePlane() {
     setGridInput(String(gridN));
   }, [gridN]);
 
-  const postCompute = React.useCallback((payload, skipThrottle = false) => {
+  const postCompute = React.useCallback((payload) => {
     const worker = workerRef.current;
     if (!worker) return;
-    
-    // Throttle rapid updates to ~15fps during animation for smoother performance
-    const now = performance.now();
-    const timeSinceLastCompute = now - lastComputeTimeRef.current;
-    if (!skipThrottle && timeSinceLastCompute < 66) {
-      // Queue this payload instead of dropping it
-      queuedPayloadRef.current = payload;
-      return;
-    }
-    
     if (inflightRef.current) {
       queuedPayloadRef.current = payload;
       return;
     }
-    
-    lastComputeTimeRef.current = now;
     const requestId = requestIdRef.current + 1;
     requestIdRef.current = requestId;
     inflightRef.current = true;
@@ -247,8 +246,8 @@ export default function PhasePlane() {
 
   React.useEffect(() => {
     if (!workerReady) return;
-    postCompute({ exprX, exprY, params, domain, gridN, seeds });
-  }, [exprX, exprY, params, domain, gridN, seeds, postCompute, workerReady]);
+    postCompute({ exprX, exprY, params, domain, gridN, seeds, fastMode: anim.enabled });
+  }, [exprX, exprY, params, domain, gridN, seeds, postCompute, workerReady, anim.enabled]);
 
   React.useEffect(() => {
     const canvas = canvasRef.current;

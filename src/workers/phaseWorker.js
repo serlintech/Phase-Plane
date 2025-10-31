@@ -1,7 +1,7 @@
 /* eslint-env worker */
-/* global self */
 import { create, all } from "mathjs";
 
+/* eslint-disable no-restricted-globals */
 const workerScope = typeof self === "object" && self ? self : null;
 if (!workerScope || typeof workerScope.addEventListener !== "function" || typeof workerScope.postMessage !== "function") {
   throw new Error("Phase worker running without a valid worker global scope.");
@@ -335,7 +335,7 @@ workerScope.addEventListener("message", (event) => {
   };
 
   try {
-    const { exprX, exprY, params = {}, domain, gridN = 40, seeds = [] } = payload || {};
+    const { exprX, exprY, params = {}, domain, gridN = 40, seeds = [], fastMode = false } = payload || {};
     if (!domain) {
       result.status = "error";
       result.message = "Domain missing";
@@ -377,7 +377,7 @@ workerScope.addEventListener("message", (event) => {
     }
     result.vectorField = vectorField;
 
-    // Nullclines
+    // Nullclines (always compute, essential for visualization)
     const nullclineF = computeNullcline("f", compiled, params, domain, gridN);
     const nullclineG = computeNullcline("g", compiled, params, domain, gridN);
     result.nullclines = {
@@ -385,64 +385,68 @@ workerScope.addEventListener("message", (event) => {
       g: nullclineG.polylines,
     };
 
-    // Intersections + refinement
-    const intersections = [];
-    const segTol = 1e-6;
-    const segmentIntersect = (a0, a1, b0, b1) => {
-      const r0 = [a1[0] - a0[0], a1[1] - a0[1]];
-      const r1 = [b1[0] - b0[0], b1[1] - b0[1]];
-      const det = r0[0] * r1[1] - r0[1] * r1[0];
-      if (Math.abs(det) < segTol) return null;
-      const diff = [b0[0] - a0[0], b0[1] - a0[1]];
-      const t = (diff[0] * r1[1] - diff[1] * r1[0]) / det;
-      const u = (diff[0] * r0[1] - diff[1] * r0[0]) / det;
-      if (t < -segTol || t > 1 + segTol || u < -segTol || u > 1 + segTol) return null;
-      return [a0[0] + t * r0[0], a0[1] + t * r0[1]];
-    };
-
-    for (const segF of nullclineF.segments) {
-      for (const segG of nullclineG.segments) {
-        const pt = segmentIntersect(segF[0], segF[1], segG[0], segG[1]);
-        if (pt) intersections.push(pt);
-      }
-    }
-
+    // Equilibria (skip expensive refinement in fast mode)
     const refinedPoints = [];
-    for (const pt of intersections) {
-      const refined = refinePoint(compiled, params, pt[0], pt[1]);
-      if (!refined) continue;
-      if (!refinedPoints.some((q) => approxEqualPoint(q, refined, 1e-4))) {
-        refinedPoints.push(refined);
-      }
-    }
+    if (!fastMode) {
+      // Intersections + refinement
+      const intersections = [];
+      const segTol = 1e-6;
+      const segmentIntersect = (a0, a1, b0, b1) => {
+        const r0 = [a1[0] - a0[0], a1[1] - a0[1]];
+        const r1 = [b1[0] - b0[0], b1[1] - b0[1]];
+        const det = r0[0] * r1[1] - r0[1] * r1[0];
+        if (Math.abs(det) < segTol) return null;
+        const diff = [b0[0] - a0[0], b0[1] - a0[1]];
+        const t = (diff[0] * r1[1] - diff[1] * r1[0]) / det;
+        const u = (diff[0] * r0[1] - diff[1] * r0[0]) / det;
+        if (t < -segTol || t > 1 + segTol || u < -segTol || u > 1 + segTol) return null;
+        return [a0[0] + t * r0[0], a0[1] + t * r0[1]];
+      };
 
-    const Mseed = 36;
-    for (let i = 0; i <= Mseed; i++) {
-      for (let j = 0; j <= Mseed; j++) {
-        const x = lerp(xMin, xMax, i / Mseed);
-        const y = lerp(yMin, yMax, j / Mseed);
-        const [u, v] = evalFG(compiled, params, x, y);
-        if (!Number.isFinite(u) || !Number.isFinite(v)) continue;
-        if (Math.hypot(u, v) < 1e-2) {
-          const refined = refinePoint(compiled, params, x, y);
-          if (refined && !refinedPoints.some((q) => approxEqualPoint(q, refined, 1e-4))) {
-            refinedPoints.push(refined);
+      for (const segF of nullclineF.segments) {
+        for (const segG of nullclineG.segments) {
+          const pt = segmentIntersect(segF[0], segF[1], segG[0], segG[1]);
+          if (pt) intersections.push(pt);
+        }
+      }
+
+      for (const pt of intersections) {
+        const refined = refinePoint(compiled, params, pt[0], pt[1]);
+        if (!refined) continue;
+        if (!refinedPoints.some((q) => approxEqualPoint(q, refined, 1e-4))) {
+          refinedPoints.push(refined);
+        }
+      }
+
+      const Mseed = 36;
+      for (let i = 0; i <= Mseed; i++) {
+        for (let j = 0; j <= Mseed; j++) {
+          const x = lerp(xMin, xMax, i / Mseed);
+          const y = lerp(yMin, yMax, j / Mseed);
+          const [u, v] = evalFG(compiled, params, x, y);
+          if (!Number.isFinite(u) || !Number.isFinite(v)) continue;
+          if (Math.hypot(u, v) < 1e-2) {
+            const refined = refinePoint(compiled, params, x, y);
+            if (refined && !refinedPoints.some((q) => approxEqualPoint(q, refined, 1e-4))) {
+              refinedPoints.push(refined);
+            }
           }
         }
       }
     }
     result.equilibria = refinedPoints.map((p) => ({ x: p[0], y: p[1] }));
 
-    // Logs
+    // Logs (skip in fast mode)
     const logs = [];
-    const fTex = compiled.nodeX.toTex();
-    const gTex = compiled.nodeY.toTex();
-    logs.push({ type: "latex", text: `\\text{Parsed } f=${fTex}\\;,\\; g=${gTex}` });
-    logs.push({ type: "latex", text: `\\text{Nullclines: }\\; f(x,y)=0:\\; ${fTex}=0\\quad g(x,y)=0:\\; ${gTex}=0` });
-    const fmtPt = (x, y) => `(${x.toFixed(3)},\\;${y.toFixed(3)})`;
-    if (refinedPoints.length === 0) {
-      logs.push({ type: "latex", text: `\\text{Fixed points: none detected in domain.}` });
-    } else {
+    if (!fastMode) {
+      const fTex = compiled.nodeX.toTex();
+      const gTex = compiled.nodeY.toTex();
+      logs.push({ type: "latex", text: `\\text{Parsed } f=${fTex}\\;,\\; g=${gTex}` });
+      logs.push({ type: "latex", text: `\\text{Nullclines: }\\; f(x,y)=0:\\; ${fTex}=0\\quad g(x,y)=0:\\; ${gTex}=0` });
+      const fmtPt = (x, y) => `(${x.toFixed(3)},\\;${y.toFixed(3)})`;
+      if (refinedPoints.length === 0) {
+        logs.push({ type: "latex", text: `\\text{Fixed points: none detected in domain.}` });
+      } else {
       logs.push({
         type: "latex",
         text: `\\text{Fixed points (approx): } ${refinedPoints
@@ -480,16 +484,19 @@ workerScope.addEventListener("message", (event) => {
           });
         }
       }
+      }
     }
     result.logs = logs;
 
-    // Trajectories
+    // Trajectories (use coarser steps in fast mode for performance)
     const validSeeds = (seeds || []).filter((s) => Array.isArray(s) && s.length === 2 && s.every(Number.isFinite));
     const trajectories = [];
+    const maxSteps = fastMode ? 400 : 800; // Half steps during animation
+    const stepSize = fastMode ? 0.02 : 0.01; // Larger steps during animation
     for (const seed of validSeeds) {
       const [sx, sy] = seed;
-      const forward = integrateTrajectory(compiled, params, domain, sx, sy, +1, 800, 0.01);
-      const backward = integrateTrajectory(compiled, params, domain, sx, sy, -1, 800, 0.01).reverse();
+      const forward = integrateTrajectory(compiled, params, domain, sx, sy, +1, maxSteps, stepSize);
+      const backward = integrateTrajectory(compiled, params, domain, sx, sy, -1, maxSteps, stepSize).reverse();
       const combined = [...backward, [sx, sy], ...forward];
       if (combined.length > 1) {
         trajectories.push({ seed: [sx, sy], path: combined });
