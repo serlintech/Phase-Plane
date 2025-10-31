@@ -38,6 +38,7 @@ export default function PhasePlane() {
   const [anim, setAnim] = React.useState({ enabled: false, key: null, speed: 0.4, min: -3, max: 3 });
   const [animCache, setAnimCache] = React.useState({ frames: [], currentFrame: 0, isPlaying: false, isPrecomputing: false, progress: 0 });
   const [seeds, setSeeds] = React.useState([]);
+  const lastAnimSeedsRef = React.useRef([]);
   const [workerData, setWorkerData] = React.useState(null);
 
   const canvasRef = React.useRef(null);
@@ -258,6 +259,9 @@ export default function PhasePlane() {
     isPrecomputingRef.current = false;
     setAnimCache(prev => ({ ...prev, frames, isPrecomputing: false, progress: 100, currentFrame: 0 }));
     
+    // Save current seeds to track changes
+    lastAnimSeedsRef.current = [...seeds];
+    
     // Display the first frame immediately
     if (frames.length > 0) {
       setWorkerData(frames[0].data);
@@ -267,6 +271,18 @@ export default function PhasePlane() {
   // Re-integrate trajectories into existing animation cache
   const reintegrateTrajectories = React.useCallback(async () => {
     if (animCache.frames.length === 0 || !workerRef.current) return;
+    
+    // Check if seeds have actually changed
+    const seedsChanged = seeds.length !== lastAnimSeedsRef.current.length || 
+      seeds.some((seed, i) => {
+        const lastSeed = lastAnimSeedsRef.current[i];
+        return !lastSeed || seed[0] !== lastSeed[0] || seed[1] !== lastSeed[1];
+      });
+    
+    if (!seedsChanged) {
+      line("No new trajectories to update");
+      return;
+    }
     
     isPrecomputingRef.current = true;
     setAnimCache(prev => ({ ...prev, isPrecomputing: true, progress: 0 }));
@@ -321,12 +337,15 @@ export default function PhasePlane() {
     isPrecomputingRef.current = false;
     setAnimCache(prev => ({ ...prev, frames: updatedFrames, isPrecomputing: false, progress: 100 }));
     
+    // Save current seeds to track changes
+    lastAnimSeedsRef.current = [...seeds];
+    
     // Show updated frame
     const currentFrame = animCache.currentFrame;
     if (updatedFrames[currentFrame]) {
       setWorkerData(updatedFrames[currentFrame].data);
     }
-  }, [animCache.frames, animCache.currentFrame, anim.key, exprX, exprY, params, domain, gridN, seeds]);
+  }, [animCache.frames, animCache.currentFrame, anim.key, exprX, exprY, params, domain, gridN, seeds, line]);
 
   // Smooth playback of pre-computed frames
   React.useEffect(() => {
@@ -452,6 +471,8 @@ export default function PhasePlane() {
     const w = canvas.width;
     const h = canvas.height;
     ctx.clearRect(0, 0, w, h);
+    // Don't render during pre-compute - freeze the display
+    if (isPrecomputingRef.current) return;
     if (!workerData) return;
 
     const { vectorField = [], nullclines = { f: [], g: [] }, equilibria = [], trajectories = [], domain: drawDomain, gridN: drawGrid } = workerData;
