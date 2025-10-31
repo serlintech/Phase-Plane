@@ -380,18 +380,19 @@ workerScope.addEventListener("message", (event) => {
     result.vectorField = vectorField;
 
     // Nullclines (skip if only computing trajectories)
+    let nullclineF, nullclineG;
     if (!trajectoriesOnly) {
-      const nullclineF = computeNullcline("f", compiled, params, domain, gridN);
-      const nullclineG = computeNullcline("g", compiled, params, domain, gridN);
+      nullclineF = computeNullcline("f", compiled, params, domain, gridN);
+      nullclineG = computeNullcline("g", compiled, params, domain, gridN);
       result.nullclines = {
         f: nullclineF.polylines,
         g: nullclineG.polylines,
       };
     }
 
-    // Equilibria (skip expensive refinement in fast mode)
+    // Equilibria (skip expensive refinement in fast mode or trajectoriesOnly)
     const refinedPoints = [];
-    if (!fastMode) {
+    if (!fastMode && !trajectoriesOnly) {
       // Intersections + refinement
       const intersections = [];
       const segTol = 1e-6;
