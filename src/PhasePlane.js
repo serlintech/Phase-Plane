@@ -370,6 +370,7 @@ export default function PhasePlane() {
             gridN,
             seeds: newSeeds, // Only compute new seeds
             fastMode: true, // Fast mode to suppress console spam
+            trajectoriesOnly: true, // Skip vector field and nullclines for speed
           },
         });
       });

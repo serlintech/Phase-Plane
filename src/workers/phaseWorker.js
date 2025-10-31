@@ -335,7 +335,7 @@ workerScope.addEventListener("message", (event) => {
   };
 
   try {
-    const { exprX, exprY, params = {}, domain, gridN = 40, seeds = [], fastMode = false } = payload || {};
+    const { exprX, exprY, params = {}, domain, gridN = 40, seeds = [], fastMode = false, trajectoriesOnly = false } = payload || {};
     if (!domain) {
       result.status = "error";
       result.message = "Domain missing";
@@ -364,26 +364,30 @@ workerScope.addEventListener("message", (event) => {
       return;
     }
 
-    // Vector field
+    // Vector field (skip if only computing trajectories)
     const vectorField = [];
-    for (let i = 0; i < gridN; i++) {
-      for (let j = 0; j < gridN; j++) {
-        const x = lerp(xMin, xMax, gridN === 1 ? 0 : i / (gridN - 1));
-        const y = lerp(yMin, yMax, gridN === 1 ? 0 : j / (gridN - 1));
-        const [u, v] = evalFG(compiled, params, x, y);
-        if (!Number.isFinite(u) || !Number.isFinite(v)) continue;
-        vectorField.push({ x, y, u, v });
+    if (!trajectoriesOnly) {
+      for (let i = 0; i < gridN; i++) {
+        for (let j = 0; j < gridN; j++) {
+          const x = lerp(xMin, xMax, gridN === 1 ? 0 : i / (gridN - 1));
+          const y = lerp(yMin, yMax, gridN === 1 ? 0 : j / (gridN - 1));
+          const [u, v] = evalFG(compiled, params, x, y);
+          if (!Number.isFinite(u) || !Number.isFinite(v)) continue;
+          vectorField.push({ x, y, u, v });
+        }
       }
     }
     result.vectorField = vectorField;
 
-    // Nullclines (always compute, essential for visualization)
-    const nullclineF = computeNullcline("f", compiled, params, domain, gridN);
-    const nullclineG = computeNullcline("g", compiled, params, domain, gridN);
-    result.nullclines = {
-      f: nullclineF.polylines,
-      g: nullclineG.polylines,
-    };
+    // Nullclines (skip if only computing trajectories)
+    if (!trajectoriesOnly) {
+      const nullclineF = computeNullcline("f", compiled, params, domain, gridN);
+      const nullclineG = computeNullcline("g", compiled, params, domain, gridN);
+      result.nullclines = {
+        f: nullclineF.polylines,
+        g: nullclineG.polylines,
+      };
+    }
 
     // Equilibria (skip expensive refinement in fast mode)
     const refinedPoints = [];
