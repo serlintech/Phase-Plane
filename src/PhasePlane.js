@@ -58,6 +58,12 @@ export default function PhasePlane() {
 
   const { logs, line, latex, error, clear: clearLogs } = useLogs();
 
+  // Track if animation is playing to avoid worker spam
+  const isPlayingRef = React.useRef(false);
+  React.useEffect(() => {
+    isPlayingRef.current = animCache.isPlaying;
+  }, [animCache.isPlaying]);
+
   React.useEffect(() => {
     const worker = new Worker(new URL("./workers/phaseWorker.js", import.meta.url));
     workerRef.current = worker;
@@ -82,17 +88,20 @@ export default function PhasePlane() {
 
       setRequiredParams(req);
 
-      if (status === "ok") {
-        setWorkerData({
-          vectorField: vectorField ?? [],
-          nullclines: nullclines ?? { f: [], g: [] },
-          equilibria: equilibria ?? [],
-          trajectories: trajectories ?? [],
-          domain: domainResult ?? domainRef.current,
-          gridN: gridResult ?? gridNRef.current,
-        });
-      } else {
-        setWorkerData(null);
+      // Don't update workerData during animation playback - we use cached frames
+      if (!isPlayingRef.current) {
+        if (status === "ok") {
+          setWorkerData({
+            vectorField: vectorField ?? [],
+            nullclines: nullclines ?? { f: [], g: [] },
+            equilibria: equilibria ?? [],
+            trajectories: trajectories ?? [],
+            domain: domainResult ?? domainRef.current,
+            gridN: gridResult ?? gridNRef.current,
+          });
+        } else {
+          setWorkerData(null);
+        }
       }
 
       // Only update console if not dragging or during pre-compute (avoid spam)
@@ -287,17 +296,15 @@ export default function PhasePlane() {
   const reintegrateTrajectories = React.useCallback(async () => {
     if (animCache.frames.length === 0 || !workerRef.current) return;
     
-    // Check if seeds have actually changed
-    const seedsChanged = seeds.length !== lastAnimSeedsRef.current.length || 
-      seeds.some((seed, i) => {
-        const lastSeed = lastAnimSeedsRef.current[i];
-        return !lastSeed || seed[0] !== lastSeed[0] || seed[1] !== lastSeed[1];
-      });
+    // Identify NEW seeds only (don't recompute existing trajectories)
+    const newSeeds = seeds.slice(lastAnimSeedsRef.current.length);
     
-    if (!seedsChanged) {
+    if (newSeeds.length === 0) {
       line("No new trajectories to update");
       return;
     }
+    
+    line(`Computing ${newSeeds.length} new trajectory path(s)...`);
     
     isPrecomputingRef.current = true;
     setAnimCache(prev => ({ ...prev, isPrecomputing: true, progress: 0 }));
@@ -308,7 +315,7 @@ export default function PhasePlane() {
       for (let i = 0; i < updatedFrames.length; i++) {
         const frame = updatedFrames[i];
         
-        // Only recompute trajectories
+        // Only compute NEW trajectories, not all of them
         const frameData = await new Promise((resolve, reject) => {
         const requestId = requestIdRef.current + 1;
         requestIdRef.current = requestId;
@@ -339,18 +346,19 @@ export default function PhasePlane() {
             params: { ...params, [anim.key]: frame.paramValue },
             domain,
             gridN,
-            seeds,
+            seeds: newSeeds, // Only compute new seeds
             fastMode: false,
           },
         });
       });
       
       if (frameData?.status === "ok") {
+        // Append new trajectories to existing ones
         updatedFrames[i] = {
           ...frame,
           data: {
             ...frame.data,
-            trajectories: frameData.trajectories ?? [],
+            trajectories: [...frame.data.trajectories, ...(frameData.trajectories ?? [])],
           },
         };
       }
@@ -439,8 +447,10 @@ export default function PhasePlane() {
 
   React.useEffect(() => {
     if (!workerReady) return;
-    // Determine if we're in an interactive state (dragging slider or animation playing)
-    const isInteractive = isDraggingRef.current || animCache.isPlaying;
+    // CRITICAL: Don't trigger worker during animation playback - we use cached frames
+    if (animCache.isPlaying) return;
+    // Determine if we're in an interactive state (dragging slider)
+    const isInteractive = isDraggingRef.current;
     postCompute({ exprX, exprY, params, domain, gridN, seeds, fastMode: isInteractive });
   }, [exprX, exprY, params, domain, gridN, seeds, postCompute, workerReady, animCache.isPlaying]);
 
