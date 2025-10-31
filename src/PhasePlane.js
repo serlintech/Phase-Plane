@@ -205,22 +205,31 @@ export default function PhasePlane() {
     const frames = [];
     const worker = workerRef.current;
     
-    for (let i = 0; i < numFrames; i++) {
-      const t = i / (numFrames - 1);
-      const paramValue = min + t * (max - min);
-      
-      // Wait for worker to compute this frame
-      const frameData = await new Promise((resolve) => {
+    try {
+      for (let i = 0; i < numFrames; i++) {
+        const t = i / (numFrames - 1);
+        const paramValue = min + t * (max - min);
+        
+        // Wait for worker to compute this frame
+        const frameData = await new Promise((resolve, reject) => {
         const requestId = requestIdRef.current + 1;
         requestIdRef.current = requestId;
         
+        let timeoutId;
         const handler = (event) => {
           const { type, payload, requestId: rid } = event.data || {};
           if (type === "result" && rid === requestId) {
+            clearTimeout(timeoutId);
             worker.removeEventListener("message", handler);
             resolve(payload);
           }
         };
+        
+        // Timeout to prevent handler from staying attached forever
+        timeoutId = setTimeout(() => {
+          worker.removeEventListener("message", handler);
+          reject(new Error("Worker timeout"));
+        }, 10000); // 10 second timeout per frame
         
         worker.addEventListener("message", handler);
         worker.postMessage({
@@ -252,21 +261,27 @@ export default function PhasePlane() {
         });
       }
       
-      setAnimCache(prev => ({ ...prev, progress: ((i + 1) / numFrames) * 100 }));
+        setAnimCache(prev => ({ ...prev, progress: ((i + 1) / numFrames) * 100 }));
+      }
+      
+      // Mark complete and show first frame
+      isPrecomputingRef.current = false;
+      setAnimCache(prev => ({ ...prev, frames, isPrecomputing: false, progress: 100, currentFrame: 0 }));
+      
+      // Save current seeds to track changes
+      lastAnimSeedsRef.current = [...seeds];
+      
+      // Display the first frame immediately
+      if (frames.length > 0) {
+        setWorkerData(frames[0].data);
+      }
+    } catch (err) {
+      // Cleanup on error (timeout or other issues)
+      isPrecomputingRef.current = false;
+      setAnimCache(prev => ({ ...prev, isPrecomputing: false }));
+      error(`Animation render failed: ${err.message}`);
     }
-    
-    // Mark complete and show first frame
-    isPrecomputingRef.current = false;
-    setAnimCache(prev => ({ ...prev, frames, isPrecomputing: false, progress: 100, currentFrame: 0 }));
-    
-    // Save current seeds to track changes
-    lastAnimSeedsRef.current = [...seeds];
-    
-    // Display the first frame immediately
-    if (frames.length > 0) {
-      setWorkerData(frames[0].data);
-    }
-  }, [anim, exprX, exprY, params, domain, gridN, seeds]);
+  }, [anim, exprX, exprY, params, domain, gridN, seeds, error]);
 
   // Re-integrate trajectories into existing animation cache
   const reintegrateTrajectories = React.useCallback(async () => {
@@ -289,21 +304,30 @@ export default function PhasePlane() {
     const worker = workerRef.current;
     const updatedFrames = [...animCache.frames];
     
-    for (let i = 0; i < updatedFrames.length; i++) {
-      const frame = updatedFrames[i];
-      
-      // Only recompute trajectories
-      const frameData = await new Promise((resolve) => {
+    try {
+      for (let i = 0; i < updatedFrames.length; i++) {
+        const frame = updatedFrames[i];
+        
+        // Only recompute trajectories
+        const frameData = await new Promise((resolve, reject) => {
         const requestId = requestIdRef.current + 1;
         requestIdRef.current = requestId;
         
+        let timeoutId;
         const handler = (event) => {
           const { type, payload, requestId: rid } = event.data || {};
           if (type === "result" && rid === requestId) {
+            clearTimeout(timeoutId);
             worker.removeEventListener("message", handler);
             resolve(payload);
           }
         };
+        
+        // Timeout to prevent handler from staying attached forever
+        timeoutId = setTimeout(() => {
+          worker.removeEventListener("message", handler);
+          reject(new Error("Worker timeout"));
+        }, 10000); // 10 second timeout per frame
         
         worker.addEventListener("message", handler);
         worker.postMessage({
@@ -331,21 +355,27 @@ export default function PhasePlane() {
         };
       }
       
-      setAnimCache(prev => ({ ...prev, progress: ((i + 1) / updatedFrames.length) * 100 }));
+        setAnimCache(prev => ({ ...prev, progress: ((i + 1) / updatedFrames.length) * 100 }));
+      }
+      
+      isPrecomputingRef.current = false;
+      setAnimCache(prev => ({ ...prev, frames: updatedFrames, isPrecomputing: false, progress: 100 }));
+      
+      // Save current seeds to track changes
+      lastAnimSeedsRef.current = [...seeds];
+      
+      // Show updated frame
+      const currentFrame = animCache.currentFrame;
+      if (updatedFrames[currentFrame]) {
+        setWorkerData(updatedFrames[currentFrame].data);
+      }
+    } catch (err) {
+      // Cleanup on error (timeout or other issues)
+      isPrecomputingRef.current = false;
+      setAnimCache(prev => ({ ...prev, isPrecomputing: false }));
+      error(`Path update failed: ${err.message}`);
     }
-    
-    isPrecomputingRef.current = false;
-    setAnimCache(prev => ({ ...prev, frames: updatedFrames, isPrecomputing: false, progress: 100 }));
-    
-    // Save current seeds to track changes
-    lastAnimSeedsRef.current = [...seeds];
-    
-    // Show updated frame
-    const currentFrame = animCache.currentFrame;
-    if (updatedFrames[currentFrame]) {
-      setWorkerData(updatedFrames[currentFrame].data);
-    }
-  }, [animCache.frames, animCache.currentFrame, anim.key, exprX, exprY, params, domain, gridN, seeds, line]);
+  }, [animCache.frames, animCache.currentFrame, anim.key, exprX, exprY, params, domain, gridN, seeds, line, error]);
 
   // Smooth playback of pre-computed frames
   React.useEffect(() => {
