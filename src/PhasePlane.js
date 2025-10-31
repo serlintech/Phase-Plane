@@ -50,6 +50,7 @@ export default function PhasePlane() {
   const inflightRef = React.useRef(false);
   const queuedPayloadRef = React.useRef(null);
   const [workerReady, setWorkerReady] = React.useState(false);
+  const lastComputeTimeRef = React.useRef(0);
 
   const { logs, line, latex, error, clear: clearLogs } = useLogs();
 
@@ -58,7 +59,7 @@ export default function PhasePlane() {
     workerRef.current = worker;
     setWorkerReady(true);
     worker.onmessage = (event) => {
-      const { type, payload, requestId } = event.data || {};
+      const { type, payload } = event.data || {};
       if (type !== "result") return;
       const {
         status,
@@ -188,20 +189,22 @@ export default function PhasePlane() {
     if (!anim.enabled || !anim.key) return;
     let raf = 0;
     let last = performance.now();
-    const { min, max, speed } = anim;
+    const { min, max, speed, key } = anim;
     const span = max - min || 1;
     const tick = (now) => {
       const dt = (now - last) / 1000;
       last = now;
       setParams((prev) => {
-        const cur = (prev[anim.key] ?? 0) + speed * dt * span;
+        const cur = (prev[key] ?? 0) + speed * dt * span;
         const wrapped = min + (((cur - min) % span) + span) % span;
-        return { ...prev, [anim.key]: wrapped };
+        return { ...prev, [key]: wrapped };
       });
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
+    return () => {
+      if (raf) cancelAnimationFrame(raf);
+    };
   }, [anim]);
 
   React.useEffect(() => {
@@ -217,13 +220,25 @@ export default function PhasePlane() {
     setGridInput(String(gridN));
   }, [gridN]);
 
-  const postCompute = React.useCallback((payload) => {
+  const postCompute = React.useCallback((payload, skipThrottle = false) => {
     const worker = workerRef.current;
     if (!worker) return;
+    
+    // Throttle rapid updates to ~15fps during animation for smoother performance
+    const now = performance.now();
+    const timeSinceLastCompute = now - lastComputeTimeRef.current;
+    if (!skipThrottle && timeSinceLastCompute < 66) {
+      // Queue this payload instead of dropping it
+      queuedPayloadRef.current = payload;
+      return;
+    }
+    
     if (inflightRef.current) {
       queuedPayloadRef.current = payload;
       return;
     }
+    
+    lastComputeTimeRef.current = now;
     const requestId = requestIdRef.current + 1;
     requestIdRef.current = requestId;
     inflightRef.current = true;

@@ -1,4 +1,5 @@
 /* eslint-env worker */
+/* global self */
 import { create, all } from "mathjs";
 
 const workerScope = typeof self === "object" && self ? self : null;
