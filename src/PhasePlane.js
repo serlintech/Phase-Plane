@@ -297,14 +297,26 @@ export default function PhasePlane() {
     if (animCache.frames.length === 0 || !workerRef.current) return;
     
     // Identify NEW seeds only (don't recompute existing trajectories)
-    const newSeeds = seeds.slice(lastAnimSeedsRef.current.length);
+    const lastCount = lastAnimSeedsRef.current.length;
+    const currentCount = seeds.length;
+    const newSeeds = seeds.slice(lastCount);
+    
+    // Debug: Log the actual situation
+    console.log('Update Paths Debug:', {
+      lastCount,
+      currentCount,
+      newSeedsCount: newSeeds.length,
+      lastSeeds: lastAnimSeedsRef.current,
+      currentSeeds: seeds,
+      newSeeds
+    });
     
     if (newSeeds.length === 0) {
       line("No new trajectories to update");
       return;
     }
     
-    line(`Computing ${newSeeds.length} new trajectory path(s)...`);
+    line(`Computing ${newSeeds.length} new trajectory path(s) across ${animCache.frames.length} frames...`);
     
     isPrecomputingRef.current = true;
     setAnimCache(prev => ({ ...prev, isPrecomputing: true, progress: 0 }));
@@ -347,7 +359,7 @@ export default function PhasePlane() {
             domain,
             gridN,
             seeds: newSeeds, // Only compute new seeds
-            fastMode: false,
+            fastMode: true, // Fast mode to suppress console spam
           },
         });
       });
@@ -371,6 +383,8 @@ export default function PhasePlane() {
       
       // Save current seeds to track changes
       lastAnimSeedsRef.current = [...seeds];
+      
+      line(`Finished updating ${newSeeds.length} trajectory path(s)`);
       
       // Show updated frame
       const currentFrame = animCache.currentFrame;
@@ -635,6 +649,11 @@ export default function PhasePlane() {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const handleClick = (evt) => {
+      // Don't add seeds during pre-compute - it will mess up the tracking
+      if (isPrecomputingRef.current) {
+        line("Cannot add seeds during animation render/update");
+        return;
+      }
       const rect = canvas.getBoundingClientRect();
       const px = evt.clientX - rect.left;
       const py = evt.clientY - rect.top;
@@ -645,7 +664,7 @@ export default function PhasePlane() {
     };
     canvas.addEventListener("click", handleClick);
     return () => canvas.removeEventListener("click", handleClick);
-  }, [domain]);
+  }, [domain, line]);
 
   const handleDomainInputChange = (key) => (event) => {
     const value = event.target.value;
@@ -827,8 +846,9 @@ export default function PhasePlane() {
                   />
                 </label>
                 <button
-                  className="ml-2 px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 border border-slate-600"
+                  className="ml-2 px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 border border-slate-600 disabled:opacity-50"
                   title="Add a random seed"
+                  disabled={animCache.isPrecomputing}
                   onClick={() => {
                     const x = lerp(domain.xMin, domain.xMax, Math.random());
                     const y = lerp(domain.yMin, domain.yMax, Math.random());
@@ -838,8 +858,9 @@ export default function PhasePlane() {
                   Seed
                 </button>
                 <button
-                  className="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 border border-slate-600"
+                  className="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 border border-slate-600 disabled:opacity-50"
                   title="Clear seeds"
+                  disabled={animCache.isPrecomputing}
                   onClick={() => setSeeds([])}
                 >
                   Clear
