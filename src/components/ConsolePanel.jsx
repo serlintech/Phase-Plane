@@ -32,7 +32,7 @@ export default function ConsolePanel({ logs, onCommand }) {
     <div className="bg-slate-800/60 rounded-2xl p-3 flex flex-col h-72">
       <div className="text-sm text-slate-300 font-medium mb-1">Console</div>
       <div
-        className="flex-1 overflow-auto rounded-lg bg-slate-950/60 border border-slate-700 px-3 py-2 text-[13px] leading-6"
+        className="flex-1 overflow-auto rounded-lg bg-slate-950/60 border border-slate-700 px-3 py-2 text-sm leading-relaxed"
         style={{
           fontFamily:
             'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
@@ -40,16 +40,24 @@ export default function ConsolePanel({ logs, onCommand }) {
         ref={listRef}
         onScroll={onScroll}
       >
+        <style>{`
+          .katex { font-size: 0.95em !important; }
+          .katex .mord, .katex .mbin, .katex .mrel, .katex .mop { color: #cbd5e1 !important; }
+          .katex .text { color: #94a3b8 !important; }
+        `}</style>
         {logs.map((ln, i) => (
-          <div key={i}>
+          <div key={i} className="my-1">
             {ln.type === "latex" ? (
               <span
                 dangerouslySetInnerHTML={{
-                  __html: katex.renderToString(ln.text, { throwOnError: false }),
+                  __html: katex.renderToString(ln.text, { 
+                    throwOnError: false,
+                    displayMode: false
+                  }),
                 }}
               />
             ) : (
-              <span>{ln.text}</span>
+              <span className="text-slate-300">{ln.text}</span>
             )}
           </div>
         ))}

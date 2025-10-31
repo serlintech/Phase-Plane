@@ -66,12 +66,13 @@ export default function PhasePlane() {
     isPlayingRef.current = animCache.isPlaying;
   }, [animCache.isPlaying]);
 
-  // Log parameter changes cleanly to console
+  // Log parameter changes cleanly to console with section divider
   React.useEffect(() => {
     // Don't log during animation playback/scrubbing or dragging (too spammy)
     if (isPlayingRef.current || isScrubbingRef.current || isDraggingRef.current) return;
     
     // Check which params changed
+    const changedParams = [];
     Object.keys(params).forEach(key => {
       const newVal = params[key];
       const oldVal = lastParamsRef.current[key];
@@ -79,9 +80,18 @@ export default function PhasePlane() {
         // Use Greek symbols when possible
         const displayKey = key === 'mu' ? 'μ' : key === 'alpha' ? 'α' : key === 'beta' ? 'β' : 
                           key === 'gamma' ? 'γ' : key === 'delta' ? 'δ' : key === 'sigma' ? 'σ' : key;
-        line(`Parameter ${displayKey} = ${newVal.toFixed(3)}`);
+        changedParams.push({ key: displayKey, value: newVal });
       }
     });
+    
+    // Log with section divider if params changed
+    if (changedParams.length > 0) {
+      line('═══════════════════════════════════════');
+      changedParams.forEach(({ key, value }) => {
+        line(`▶ Parameter ${key} = ${value.toFixed(4)}`);
+      });
+      line('───────────────────────────────────────');
+    }
     
     lastParamsRef.current = { ...params };
   }, [params, line]);
@@ -415,34 +425,37 @@ export default function PhasePlane() {
     if (!animCache.isPlaying || animCache.frames.length === 0) return;
     
     let raf = 0;
-    const fps = 60;
-    const frameDuration = 1000 / fps;
-    let lastTime = performance.now();
+    let currentFrameIndex = animCache.currentFrame;
+    const frames = animCache.frames;
+    const animKey = anim.key;
     
-    const tick = (now) => {
-      const elapsed = now - lastTime;
-      if (elapsed >= frameDuration) {
-        lastTime = now;
-        setAnimCache(prev => {
-          const nextFrame = (prev.currentFrame + 1) % prev.frames.length;
-          const frame = prev.frames[nextFrame];
-          if (frame) {
-            // Update display with cached frame data
-            setWorkerData(frame.data);
-            // Update param value for sliders
-            if (anim.key) {
-              setParams(p => ({ ...p, [anim.key]: frame.paramValue }));
-            }
-          }
-          return { ...prev, currentFrame: nextFrame };
-        });
+    const tick = () => {
+      currentFrameIndex = (currentFrameIndex + 1) % frames.length;
+      const frame = frames[currentFrameIndex];
+      
+      if (frame) {
+        // Update display with cached frame data
+        setWorkerData(frame.data);
+        // Update param value for sliders
+        if (animKey) {
+          setParams(p => ({ ...p, [animKey]: frame.paramValue }));
+        }
+        // Update frame counter less frequently (every 5 frames to reduce re-renders)
+        if (currentFrameIndex % 5 === 0) {
+          setAnimCache(prev => ({ ...prev, currentFrame: currentFrameIndex }));
+        }
       }
+      
       raf = requestAnimationFrame(tick);
     };
     
     raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [animCache.isPlaying, animCache.frames.length, anim.key]);
+    return () => {
+      cancelAnimationFrame(raf);
+      // Update final frame position
+      setAnimCache(prev => ({ ...prev, currentFrame: currentFrameIndex }));
+    };
+  }, [animCache.isPlaying, animCache.frames, animCache.currentFrame, anim.key]);
 
   React.useEffect(() => {
     setDomainInputs({
@@ -971,13 +984,21 @@ export default function PhasePlane() {
                         isScrubbingRef.current = true;
                       }}
                       onMouseUp={() => {
-                        isScrubbingRef.current = false;
+                        // Delay to allow final compute after scrubbing
+                        setTimeout(() => {
+                          isScrubbingRef.current = false;
+                          // Trigger a full-quality compute for the final frame
+                          setParams(prev => ({ ...prev }));
+                        }, 100);
                       }}
                       onTouchStart={() => {
                         isScrubbingRef.current = true;
                       }}
                       onTouchEnd={() => {
-                        isScrubbingRef.current = false;
+                        setTimeout(() => {
+                          isScrubbingRef.current = false;
+                          setParams(prev => ({ ...prev }));
+                        }, 100);
                       }}
                       onChange={(e) => {
                         const frameIndex = Number(e.target.value);
