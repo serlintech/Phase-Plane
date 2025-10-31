@@ -36,6 +36,7 @@ export default function PhasePlane() {
   const [paramDefs, setParamDefs] = React.useState({});
   const [requiredParams, setRequiredParams] = React.useState([]);
   const [anim, setAnim] = React.useState({ enabled: false, key: null, speed: 0.4, min: -3, max: 3 });
+  const [animCache, setAnimCache] = React.useState({ frames: [], currentFrame: 0, isPlaying: false, isPrecomputing: false, progress: 0 });
   const [seeds, setSeeds] = React.useState([]);
   const [workerData, setWorkerData] = React.useState(null);
 
@@ -50,6 +51,8 @@ export default function PhasePlane() {
   const inflightRef = React.useRef(false);
   const queuedPayloadRef = React.useRef(null);
   const [workerReady, setWorkerReady] = React.useState(false);
+  const isDraggingRef = React.useRef(false);
+  const dragTimeoutRef = React.useRef(null);
 
   const { logs, line, latex, error, clear: clearLogs } = useLogs();
 
@@ -90,7 +93,8 @@ export default function PhasePlane() {
         setWorkerData(null);
       }
 
-      if (newLogs.length) {
+      // Only update console if not dragging or during pre-compute (avoid spam)
+      if (newLogs.length && !isDraggingRef.current && !animCache.isPrecomputing) {
         const signature = reportSignature || newLogs.map((entry) => `${entry.type}:${entry.text}`).join("|");
         if (signature !== lastReportSigRef.current) {
           lastReportSigRef.current = signature;
@@ -184,39 +188,162 @@ export default function PhasePlane() {
     });
   }, [requiredParams]);
 
-  React.useEffect(() => {
-    if (!anim.enabled || !anim.key) return;
-    let raf = 0;
-    let lastUpdate = performance.now();
-    const { min, max, speed, key } = anim;
-    const span = max - min || 1;
+  // Pre-compute animation frames
+  const precomputeAnimation = React.useCallback(async () => {
+    const { key, min, max } = anim;
+    if (!key || !workerRef.current) return;
     
-    // Adaptive frame time: slower speeds = less frequent updates for same smoothness
-    // At speed 0.4: ~20fps, at speed 0.05: ~10fps, at speed 0.01: ~5fps
-    const getFrameTime = (spd) => {
-      const baseTime = 50; // 20fps baseline
-      return Math.max(baseTime, baseTime * (0.4 / Math.max(0.01, Math.abs(spd))));
-    };
+    setAnimCache(prev => ({ ...prev, isPrecomputing: true, progress: 0, frames: [] }));
+    
+    const numFrames = 120; // 2 seconds at 60fps for smooth playback
+    const frames = [];
+    const worker = workerRef.current;
+    const currentWorkerData = workerData; // Save current display
+    
+    for (let i = 0; i < numFrames; i++) {
+      const t = i / (numFrames - 1);
+      const paramValue = min + t * (max - min);
+      
+      // Wait for worker to compute this frame
+      const frameData = await new Promise((resolve) => {
+        const requestId = requestIdRef.current + 1;
+        requestIdRef.current = requestId;
+        
+        const handler = (event) => {
+          const { type, payload, requestId: rid } = event.data || {};
+          if (type === "result" && rid === requestId) {
+            worker.removeEventListener("message", handler);
+            resolve(payload);
+          }
+        };
+        
+        worker.addEventListener("message", handler);
+        worker.postMessage({
+          type: "compute",
+          requestId,
+          payload: {
+            exprX,
+            exprY,
+            params: { ...params, [key]: paramValue },
+            domain,
+            gridN,
+            seeds,
+            fastMode: false, // Full quality for pre-compute
+          },
+        });
+      });
+      
+      if (frameData?.status === "ok") {
+        frames.push({
+          paramValue,
+          data: {
+            vectorField: frameData.vectorField ?? [],
+            nullclines: frameData.nullclines ?? { f: [], g: [] },
+            equilibria: frameData.equilibria ?? [],
+            trajectories: frameData.trajectories ?? [],
+            domain: frameData.domain ?? domain,
+            gridN: frameData.gridN ?? gridN,
+          },
+        });
+      }
+      
+      setAnimCache(prev => ({ ...prev, progress: ((i + 1) / numFrames) * 100 }));
+    }
+    
+    // Restore original display after pre-compute
+    setWorkerData(currentWorkerData);
+    setAnimCache(prev => ({ ...prev, frames, isPrecomputing: false, progress: 100, currentFrame: 0 }));
+  }, [anim, exprX, exprY, params, domain, gridN, seeds, workerData]);
+
+  // Re-integrate trajectories into existing animation cache
+  const reintegrateTrajectories = React.useCallback(async () => {
+    if (animCache.frames.length === 0 || !workerRef.current) return;
+    
+    setAnimCache(prev => ({ ...prev, isPrecomputing: true, progress: 0 }));
+    const worker = workerRef.current;
+    const updatedFrames = [...animCache.frames];
+    
+    for (let i = 0; i < updatedFrames.length; i++) {
+      const frame = updatedFrames[i];
+      
+      // Only recompute trajectories
+      const frameData = await new Promise((resolve) => {
+        const requestId = requestIdRef.current + 1;
+        requestIdRef.current = requestId;
+        
+        const handler = (event) => {
+          const { type, payload, requestId: rid } = event.data || {};
+          if (type === "result" && rid === requestId) {
+            worker.removeEventListener("message", handler);
+            resolve(payload);
+          }
+        };
+        
+        worker.addEventListener("message", handler);
+        worker.postMessage({
+          type: "compute",
+          requestId,
+          payload: {
+            exprX,
+            exprY,
+            params: { ...params, [anim.key]: frame.paramValue },
+            domain,
+            gridN,
+            seeds,
+            fastMode: false,
+          },
+        });
+      });
+      
+      if (frameData?.status === "ok") {
+        updatedFrames[i] = {
+          ...frame,
+          data: {
+            ...frame.data,
+            trajectories: frameData.trajectories ?? [],
+          },
+        };
+      }
+      
+      setAnimCache(prev => ({ ...prev, progress: ((i + 1) / updatedFrames.length) * 100 }));
+    }
+    
+    setAnimCache(prev => ({ ...prev, frames: updatedFrames, isPrecomputing: false, progress: 100 }));
+  }, [animCache.frames, anim.key, exprX, exprY, params, domain, gridN, seeds]);
+
+  // Smooth playback of pre-computed frames
+  React.useEffect(() => {
+    if (!animCache.isPlaying || animCache.frames.length === 0) return;
+    
+    let raf = 0;
+    const fps = 60;
+    const frameDuration = 1000 / fps;
+    let lastTime = performance.now();
     
     const tick = (now) => {
-      const minFrameTime = getFrameTime(speed);
-      // Only update params if enough time has passed
-      if (now - lastUpdate >= minFrameTime) {
-        const dt = (now - lastUpdate) / 1000;
-        lastUpdate = now;
-        setParams((prev) => {
-          const cur = (prev[key] ?? 0) + speed * dt * span;
-          const wrapped = min + (((cur - min) % span) + span) % span;
-          return { ...prev, [key]: wrapped };
+      const elapsed = now - lastTime;
+      if (elapsed >= frameDuration) {
+        lastTime = now;
+        setAnimCache(prev => {
+          const nextFrame = (prev.currentFrame + 1) % prev.frames.length;
+          const frame = prev.frames[nextFrame];
+          if (frame) {
+            // Update display with cached frame data
+            setWorkerData(frame.data);
+            // Update param value for sliders
+            if (anim.key) {
+              setParams(p => ({ ...p, [anim.key]: frame.paramValue }));
+            }
+          }
+          return { ...prev, currentFrame: nextFrame };
         });
       }
       raf = requestAnimationFrame(tick);
     };
+    
     raf = requestAnimationFrame(tick);
-    return () => {
-      if (raf) cancelAnimationFrame(raf);
-    };
-  }, [anim]);
+    return () => cancelAnimationFrame(raf);
+  }, [animCache.isPlaying, animCache.frames.length, anim.key]);
 
   React.useEffect(() => {
     setDomainInputs({
@@ -246,8 +373,10 @@ export default function PhasePlane() {
 
   React.useEffect(() => {
     if (!workerReady) return;
-    postCompute({ exprX, exprY, params, domain, gridN, seeds, fastMode: anim.enabled });
-  }, [exprX, exprY, params, domain, gridN, seeds, postCompute, workerReady, anim.enabled]);
+    // Determine if we're in an interactive state (dragging slider or animation playing)
+    const isInteractive = isDraggingRef.current || animCache.isPlaying;
+    postCompute({ exprX, exprY, params, domain, gridN, seeds, fastMode: isInteractive });
+  }, [exprX, exprY, params, domain, gridN, seeds, postCompute, workerReady, animCache.isPlaying]);
 
   React.useEffect(() => {
     const canvas = canvasRef.current;
@@ -644,42 +773,95 @@ export default function PhasePlane() {
 
         <div className="md:col-span-1 space-y-4 h-full overflow-auto md:order-1">
           <div className="bg-slate-800/60 rounded-2xl p-3">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between mb-2">
               <span className="text-sm text-slate-300 font-medium">Parameters</span>
               <div className="flex items-center gap-2">
-                <label className="flex items-center gap-2 text-xs text-slate-300">
-                  <input
-                    type="checkbox"
-                    checked={anim.enabled}
-                    onChange={(event) => setAnim((prev) => ({ ...prev, enabled: event.target.checked }))}
-                  />
-                  Animate
-                </label>
                 <select
                   className="text-xs bg-slate-900/60 rounded px-2 py-1 border border-slate-700"
                   value={anim.key ?? ""}
                   onChange={(event) => setAnim((prev) => ({ ...prev, key: event.target.value || null }))}
                 >
-                  <option value="">(param)</option>
+                  <option value="">(select param)</option>
                   {Object.keys(params).map((key) => (
                     <option key={key} value={key}>
                       {key}
                     </option>
                   ))}
                 </select>
-                <label className="text-xs text-slate-300">
-                  speed
-                  <input
-                    className="ml-2 w-24 bg-slate-900/60 rounded px-2 py-1 border border-slate-700"
-                    type="number"
-                    step="0.1"
-                    value={anim.speed}
-                    onChange={(event) => setAnim((prev) => ({ ...prev, speed: Number(event.target.value) || 0 }))}
-                    disabled={!anim.key}
-                  />
-                </label>
               </div>
             </div>
+            
+            {anim.key && (
+              <div className="mb-3 p-2 bg-slate-900/40 rounded border border-slate-700">
+                <div className="text-xs text-slate-400 mb-2">Animation Controls</div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <button
+                    className="px-3 py-1 rounded bg-blue-600 hover:bg-blue-500 border border-blue-500 text-xs font-medium disabled:opacity-50"
+                    onClick={precomputeAnimation}
+                    disabled={animCache.isPrecomputing || !anim.key}
+                    title="Render smooth 60fps animation"
+                  >
+                    {animCache.isPrecomputing ? `Rendering ${Math.round(animCache.progress)}%` : '🎬 Render'}
+                  </button>
+                  <button
+                    className="px-3 py-1 rounded bg-green-600 hover:bg-green-500 border border-green-500 text-xs font-medium disabled:opacity-50"
+                    onClick={() => setAnimCache(prev => ({ ...prev, isPlaying: !prev.isPlaying }))}
+                    disabled={animCache.frames.length === 0 || animCache.isPrecomputing}
+                    title="Play/pause animation"
+                  >
+                    {animCache.isPlaying ? '⏸ Pause' : '▶ Play'}
+                  </button>
+                  {animCache.frames.length > 0 && (
+                    <button
+                      className="px-3 py-1 rounded bg-purple-600 hover:bg-purple-500 border border-purple-500 text-xs font-medium disabled:opacity-50"
+                      onClick={reintegrateTrajectories}
+                      disabled={animCache.isPrecomputing}
+                      title="Update trajectories in animation"
+                    >
+                      Update Paths
+                    </button>
+                  )}
+                  <button
+                    className="px-3 py-1 rounded bg-slate-700 hover:bg-slate-600 border border-slate-600 text-xs disabled:opacity-50"
+                    onClick={() => setAnimCache({ frames: [], currentFrame: 0, isPlaying: false, isPrecomputing: false, progress: 0 })}
+                    disabled={animCache.frames.length === 0 || animCache.isPrecomputing}
+                    title="Clear animation cache"
+                  >
+                    Clear
+                  </button>
+                  {animCache.frames.length > 0 && !animCache.isPrecomputing && (
+                    <span className="text-xs text-slate-400">
+                      {animCache.frames.length} frames • Frame {animCache.currentFrame + 1}
+                    </span>
+                  )}
+                </div>
+                {animCache.frames.length > 0 && !animCache.isPrecomputing && (
+                  <div className="mt-2">
+                    <input
+                      type="range"
+                      min="0"
+                      max={animCache.frames.length - 1}
+                      value={animCache.currentFrame}
+                      className="w-full"
+                      onChange={(e) => {
+                        const frameIndex = Number(e.target.value);
+                        setAnimCache(prev => {
+                          const frame = prev.frames[frameIndex];
+                          if (frame) {
+                            setWorkerData(frame.data);
+                            if (anim.key) {
+                              setParams(p => ({ ...p, [anim.key]: frame.paramValue }));
+                            }
+                          }
+                          return { ...prev, currentFrame: frameIndex, isPlaying: false };
+                        });
+                      }}
+                      title="Scrub through animation"
+                    />
+                  </div>
+                )}
+              </div>
+            )}
 
             <div className="mt-2 space-y-3">
               {Object.keys(params).length === 0 && (
@@ -699,6 +881,28 @@ export default function PhasePlane() {
                       max={def.max}
                       step={def.step}
                       value={params[key]}
+                      onMouseDown={() => {
+                        isDraggingRef.current = true;
+                        if (dragTimeoutRef.current) clearTimeout(dragTimeoutRef.current);
+                      }}
+                      onMouseUp={() => {
+                        // Delay marking as not dragging to allow final render with full quality
+                        dragTimeoutRef.current = setTimeout(() => {
+                          isDraggingRef.current = false;
+                          // Trigger full-quality render after drag ends
+                          setParams((prev) => ({ ...prev }));
+                        }, 100);
+                      }}
+                      onTouchStart={() => {
+                        isDraggingRef.current = true;
+                        if (dragTimeoutRef.current) clearTimeout(dragTimeoutRef.current);
+                      }}
+                      onTouchEnd={() => {
+                        dragTimeoutRef.current = setTimeout(() => {
+                          isDraggingRef.current = false;
+                          setParams((prev) => ({ ...prev }));
+                        }, 100);
+                      }}
                       onChange={(event) => setParams((prev) => ({ ...prev, [key]: Number(event.target.value) }))}
                     />
                     <input
