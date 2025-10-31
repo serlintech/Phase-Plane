@@ -297,19 +297,7 @@ export default function PhasePlane() {
     if (animCache.frames.length === 0 || !workerRef.current) return;
     
     // Identify NEW seeds only (don't recompute existing trajectories)
-    const lastCount = lastAnimSeedsRef.current.length;
-    const currentCount = seeds.length;
-    const newSeeds = seeds.slice(lastCount);
-    
-    // Debug: Log the actual situation
-    console.log('Update Paths Debug:', {
-      lastCount,
-      currentCount,
-      newSeedsCount: newSeeds.length,
-      lastSeeds: lastAnimSeedsRef.current,
-      currentSeeds: seeds,
-      newSeeds
-    });
+    const newSeeds = seeds.slice(lastAnimSeedsRef.current.length);
     
     if (newSeeds.length === 0) {
       line("No new trajectories to update");
@@ -890,9 +878,18 @@ export default function PhasePlane() {
               </div>
             </div>
             
-            {anim.key && (
+            {anim.key && (() => {
+              // Check if trajectories are out of sync with animation
+              const hasNewSeeds = animCache.frames.length > 0 && seeds.length !== lastAnimSeedsRef.current.length;
+              
+              return (
               <div className="mb-3 p-2 bg-slate-900/40 rounded border border-slate-700">
                 <div className="text-xs text-slate-400 mb-2">Animation Controls</div>
+                {hasNewSeeds && (
+                  <div className="mb-2 px-2 py-1 bg-yellow-900/30 border border-yellow-700/50 rounded text-xs text-yellow-200">
+                    ⚠️ New trajectories added. Click "Update Paths" to include them in animation.
+                  </div>
+                )}
                 <div className="flex items-center gap-2 flex-wrap">
                   <button
                     className="px-3 py-1 rounded bg-blue-600 hover:bg-blue-500 border border-blue-500 text-xs font-medium disabled:opacity-50"
@@ -905,19 +902,23 @@ export default function PhasePlane() {
                   <button
                     className="px-3 py-1 rounded bg-green-600 hover:bg-green-500 border border-green-500 text-xs font-medium disabled:opacity-50"
                     onClick={() => setAnimCache(prev => ({ ...prev, isPlaying: !prev.isPlaying }))}
-                    disabled={animCache.frames.length === 0 || animCache.isPrecomputing}
-                    title="Play/pause animation"
+                    disabled={animCache.frames.length === 0 || animCache.isPrecomputing || hasNewSeeds}
+                    title={hasNewSeeds ? "Update paths before playing" : "Play/pause animation"}
                   >
                     {animCache.isPlaying ? '⏸ Pause' : '▶ Play'}
                   </button>
                   {animCache.frames.length > 0 && (
                     <button
-                      className="px-3 py-1 rounded bg-purple-600 hover:bg-purple-500 border border-purple-500 text-xs font-medium disabled:opacity-50"
+                      className={`px-3 py-1 rounded border text-xs font-medium disabled:opacity-50 ${
+                        hasNewSeeds 
+                          ? 'bg-yellow-600 hover:bg-yellow-500 border-yellow-500 animate-pulse' 
+                          : 'bg-purple-600 hover:bg-purple-500 border-purple-500'
+                      }`}
                       onClick={reintegrateTrajectories}
                       disabled={animCache.isPrecomputing}
                       title="Update trajectories in animation"
                     >
-                      Update Paths
+                      Update Paths {hasNewSeeds && '⚠️'}
                     </button>
                   )}
                   <button
@@ -941,7 +942,8 @@ export default function PhasePlane() {
                       min="0"
                       max={animCache.frames.length - 1}
                       value={animCache.currentFrame}
-                      className="w-full"
+                      className="w-full disabled:opacity-50"
+                      disabled={hasNewSeeds}
                       onChange={(e) => {
                         const frameIndex = Number(e.target.value);
                         setAnimCache(prev => {
@@ -955,12 +957,13 @@ export default function PhasePlane() {
                           return { ...prev, currentFrame: frameIndex, isPlaying: false };
                         });
                       }}
-                      title="Scrub through animation"
+                      title={hasNewSeeds ? "Update paths before scrubbing" : "Scrub through animation"}
                     />
                   </div>
                 )}
               </div>
-            )}
+              );
+            })()}
 
             <div className="mt-2 space-y-3">
               {Object.keys(params).length === 0 && (
