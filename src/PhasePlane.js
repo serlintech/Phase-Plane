@@ -55,14 +55,36 @@ export default function PhasePlane() {
   const isDraggingRef = React.useRef(false);
   const dragTimeoutRef = React.useRef(null);
   const isPrecomputingRef = React.useRef(false);
+  const isScrubbingRef = React.useRef(false);
 
   const { logs, line, latex, error, clear: clearLogs } = useLogs();
+  const lastParamsRef = React.useRef({});
 
   // Track if animation is playing to avoid worker spam
   const isPlayingRef = React.useRef(false);
   React.useEffect(() => {
     isPlayingRef.current = animCache.isPlaying;
   }, [animCache.isPlaying]);
+
+  // Log parameter changes cleanly to console
+  React.useEffect(() => {
+    // Don't log during animation playback/scrubbing or dragging (too spammy)
+    if (isPlayingRef.current || isScrubbingRef.current || isDraggingRef.current) return;
+    
+    // Check which params changed
+    Object.keys(params).forEach(key => {
+      const newVal = params[key];
+      const oldVal = lastParamsRef.current[key];
+      if (newVal !== oldVal && oldVal !== undefined) {
+        // Use Greek symbols when possible
+        const displayKey = key === 'mu' ? 'μ' : key === 'alpha' ? 'α' : key === 'beta' ? 'β' : 
+                          key === 'gamma' ? 'γ' : key === 'delta' ? 'δ' : key === 'sigma' ? 'σ' : key;
+        line(`Parameter ${displayKey} = ${newVal.toFixed(3)}`);
+      }
+    });
+    
+    lastParamsRef.current = { ...params };
+  }, [params, line]);
 
   React.useEffect(() => {
     const worker = new Worker(new URL("./workers/phaseWorker.js", import.meta.url));
@@ -449,8 +471,8 @@ export default function PhasePlane() {
 
   React.useEffect(() => {
     if (!workerReady) return;
-    // CRITICAL: Don't trigger worker during animation playback - we use cached frames
-    if (animCache.isPlaying) return;
+    // CRITICAL: Don't trigger worker during animation playback/scrubbing - we use cached frames
+    if (animCache.isPlaying || isScrubbingRef.current) return;
     // Determine if we're in an interactive state (dragging slider)
     const isInteractive = isDraggingRef.current;
     postCompute({ exprX, exprY, params, domain, gridN, seeds, fastMode: isInteractive });
@@ -944,6 +966,18 @@ export default function PhasePlane() {
                       value={animCache.currentFrame}
                       className="w-full disabled:opacity-50"
                       disabled={hasNewSeeds}
+                      onMouseDown={() => {
+                        isScrubbingRef.current = true;
+                      }}
+                      onMouseUp={() => {
+                        isScrubbingRef.current = false;
+                      }}
+                      onTouchStart={() => {
+                        isScrubbingRef.current = true;
+                      }}
+                      onTouchEnd={() => {
+                        isScrubbingRef.current = false;
+                      }}
                       onChange={(e) => {
                         const frameIndex = Number(e.target.value);
                         setAnimCache(prev => {
