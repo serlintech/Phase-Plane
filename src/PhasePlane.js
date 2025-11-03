@@ -2,6 +2,15 @@ import React from "react";
 import ConsolePanel from "./components/ConsolePanel";
 
 const lerp = (a, b, t) => a + (b - a) * t;
+
+// Blue→Red gradient for t in [0,1] via direct RGB blend (avoids green)
+const speedToColor = (t) => {
+  const clamped = Math.max(0, Math.min(1, t));
+  const r = Math.round(255 * clamped);
+  const g = 0;
+  const b = Math.round(255 * (1 - clamped));
+  return `rgb(${r}, ${g}, ${b})`;
+};
 const defaultDomain = { xMin: -3, xMax: 3, yMin: -3, yMax: 3 };
 
 function useLogs() {
@@ -40,6 +49,18 @@ export default function PhasePlane() {
   const [seeds, setSeeds] = React.useState([]);
   const lastAnimSeedsRef = React.useRef([]);
   const [workerData, setWorkerData] = React.useState(null);
+  const [layers, setLayers] = React.useState({
+    axes: true,
+    vectorField: true,
+    nullclineF: true,
+    nullclineG: true,
+    equilibria: true,
+    trajectories: true,
+    legend: true,
+  });
+  const toggleLayer = React.useCallback((key) => {
+    setLayers((prev) => ({ ...prev, [key]: !prev[key] }));
+  }, []);
 
   const canvasRef = React.useRef(null);
   const workerRef = React.useRef(null);
@@ -559,47 +580,51 @@ export default function PhasePlane() {
     const x2px = (x) => ((x - xMin) / (xMax - xMin)) * w;
     const y2px = (y) => (1 - (y - yMin) / (yMax - yMin)) * h;
 
-    ctx.save();
-    ctx.strokeStyle = "#475569";
-    ctx.lineWidth = 1;
-    const y0 = y2px(0);
-    ctx.beginPath();
-    ctx.moveTo(0, y0);
-    ctx.lineTo(w, y0);
-    ctx.stroke();
-    const x0 = x2px(0);
-    ctx.beginPath();
-    ctx.moveTo(x0, 0);
-    ctx.lineTo(x0, h);
-    ctx.stroke();
-    ctx.restore();
-
-    ctx.save();
-    ctx.globalAlpha = 0.35;
-    const scale = 0.6 * Math.min(w, h) / (Math.max(1, drawGrid) * 4);
-    vectorField.forEach(({ x, y, u, v }) => {
-      const magnitude = Math.hypot(u, v) || 1e-6;
-      const dx = (u / magnitude) * scale;
-      const dy = (v / magnitude) * scale;
-      const px = x2px(x);
-      const py = y2px(y);
+    if (layers.axes) {
+      ctx.save();
+      ctx.strokeStyle = "#475569";
+      ctx.lineWidth = 1;
+      const y0 = y2px(0);
       ctx.beginPath();
-      ctx.moveTo(px - dx, py - dy);
-      ctx.lineTo(px + dx, py + dy);
-      ctx.strokeStyle = "#94a3b8";
-      ctx.lineWidth = 1.2;
+      ctx.moveTo(0, y0);
+      ctx.lineTo(w, y0);
       ctx.stroke();
-      const angle = Math.atan2(dy, dx);
-      const head = 3;
+      const x0 = x2px(0);
       ctx.beginPath();
-      ctx.moveTo(px + dx, py + dy);
-      ctx.lineTo(px + dx - head * Math.cos(angle - Math.PI / 6), py + dy - head * Math.sin(angle - Math.PI / 6));
-      ctx.lineTo(px + dx - head * Math.cos(angle + Math.PI / 6), py + dy - head * Math.sin(angle + Math.PI / 6));
-      ctx.closePath();
-      ctx.fillStyle = "#94a3b8";
-      ctx.fill();
-    });
-    ctx.restore();
+      ctx.moveTo(x0, 0);
+      ctx.lineTo(x0, h);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    if (layers.vectorField) {
+      ctx.save();
+      ctx.globalAlpha = 0.35;
+      const scale = 0.6 * Math.min(w, h) / (Math.max(1, drawGrid) * 4);
+      vectorField.forEach(({ x, y, u, v }) => {
+        const magnitude = Math.hypot(u, v) || 1e-6;
+        const dx = (u / magnitude) * scale;
+        const dy = (v / magnitude) * scale;
+        const px = x2px(x);
+        const py = y2px(y);
+        ctx.beginPath();
+        ctx.moveTo(px - dx, py - dy);
+        ctx.lineTo(px + dx, py + dy);
+        ctx.strokeStyle = "#94a3b8";
+        ctx.lineWidth = 1.2;
+        ctx.stroke();
+        const angle = Math.atan2(dy, dx);
+        const head = 3;
+        ctx.beginPath();
+        ctx.moveTo(px + dx, py + dy);
+        ctx.lineTo(px + dx - head * Math.cos(angle - Math.PI / 6), py + dy - head * Math.sin(angle - Math.PI / 6));
+        ctx.lineTo(px + dx - head * Math.cos(angle + Math.PI / 6), py + dy - head * Math.sin(angle + Math.PI / 6));
+        ctx.closePath();
+        ctx.fillStyle = "#94a3b8";
+        ctx.fill();
+      });
+      ctx.restore();
+    }
 
     const drawPolylines = (polylines, color) => {
       ctx.save();
@@ -621,53 +646,114 @@ export default function PhasePlane() {
       ctx.restore();
     };
 
-    drawPolylines(nullclines.f, "#22d3ee");
-    drawPolylines(nullclines.g, "#f472b6");
+    if (layers.nullclineF) drawPolylines(nullclines.f, "#22d3ee");
+    if (layers.nullclineG) drawPolylines(nullclines.g, "#f472b6");
 
-    ctx.save();
-    ctx.fillStyle = "#fef08a";
-    ctx.strokeStyle = "#f59e0b";
-    equilibria.forEach(({ x, y }) => {
-      const px = x2px(x);
-      const py = y2px(y);
-      ctx.beginPath();
-      ctx.arc(px, py, 4, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.stroke();
-    });
-    ctx.restore();
-
-    ctx.save();
-    ctx.lineWidth = 2;
-    ctx.strokeStyle = "#eab308";
-    trajectories.forEach(({ path }) => {
-      if (!path || path.length < 2) return;
-      ctx.beginPath();
-      path.forEach(([x, y], idx) => {
+    if (layers.equilibria) {
+      ctx.save();
+      ctx.fillStyle = "#fef08a";
+      ctx.strokeStyle = "#f59e0b";
+      equilibria.forEach(({ x, y }) => {
         const px = x2px(x);
         const py = y2px(y);
-        if (idx === 0) ctx.moveTo(px, py);
-        else ctx.lineTo(px, py);
-      });
-      ctx.stroke();
-      for (let i = 15; i < path.length; i += 25) {
-        const [x1, y1] = path[i - 1];
-        const [x2, y2] = path[i];
-        const angle = Math.atan2(y2 - y1, x2 - x1);
-        const px = x2px(x2);
-        const py = y2px(y2);
-        const head = 4;
         ctx.beginPath();
-        ctx.moveTo(px, py);
-        ctx.lineTo(px - head * Math.cos(angle - Math.PI / 6), py - head * Math.sin(angle - Math.PI / 6));
-        ctx.lineTo(px - head * Math.cos(angle + Math.PI / 6), py - head * Math.sin(angle + Math.PI / 6));
-        ctx.closePath();
-        ctx.fillStyle = "#eab308";
+        ctx.arc(px, py, 4, 0, Math.PI * 2);
         ctx.fill();
+        ctx.stroke();
+      });
+      ctx.restore();
+    }
+
+    // Build vector field magnitude lookup and global min/max
+    const vfPoints = (vectorField || []).map(({ x, y, u, v }) => ({ x, y, mag: Math.hypot(u, v) }));
+    let speedMin = Infinity;
+    let speedMax = 0;
+    for (let i = 0; i < vfPoints.length; i++) {
+      const m = vfPoints[i].mag;
+      if (m < speedMin) speedMin = m;
+      if (m > speedMax) speedMax = m;
+    }
+    if (!Number.isFinite(speedMin)) speedMin = 0;
+    const span = speedMax - speedMin || 1;
+
+    const getMagAt = (x, y) => {
+      if (vfPoints.length === 0) return NaN;
+      let best = vfPoints[0].mag;
+      let bestD = Infinity;
+      const sx = xMax - xMin || 1;
+      const sy = yMax - yMin || 1;
+      for (let i = 0; i < vfPoints.length; i++) {
+        const p = vfPoints[i];
+        const dx = (x - p.x) / sx;
+        const dy = (y - p.y) / sy;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < bestD) {
+          bestD = d2;
+          best = p.mag;
+        }
       }
-    });
-    ctx.restore();
-  }, [workerData, domain, viewportTick]);
+      return best;
+    };
+
+    if (layers.trajectories) {
+      ctx.save();
+      ctx.lineWidth = 2;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      trajectories.forEach(({ path }) => {
+      if (!path || path.length < 2) return;
+        // Draw colored segments by speed (sample nearest vector-field at segment midpoint)
+        for (let i = 1; i < path.length; i++) {
+          const [x1, y1] = path[i - 1];
+          const [x2, y2] = path[i];
+          const px1 = x2px(x1), py1 = y2px(y1);
+          const px2 = x2px(x2), py2 = y2px(y2);
+          const mx = 0.5 * (x1 + x2);
+          const my = 0.5 * (y1 + y2);
+          let s = getMagAt(mx, my);
+          if (!Number.isFinite(s)) s = Math.hypot(x2 - x1, y2 - y1);
+          const t = (s - speedMin) / span;
+          ctx.beginPath();
+          ctx.moveTo(px1, py1);
+          ctx.lineTo(px2, py2);
+          ctx.strokeStyle = speedToColor(t);
+          ctx.stroke();
+        }
+
+        // Direction arrows placed by pixel distance for visibility
+        let accPx = 0;
+        const arrowEveryPx = 48;
+        for (let i = 1; i < path.length; i++) {
+          const [x1, y1] = path[i - 1];
+          const [x2, y2] = path[i];
+          const px1 = x2px(x1), py1 = y2px(y1);
+          const px2 = x2px(x2), py2 = y2px(y2);
+          const segPx = Math.hypot(px2 - px1, py2 - py1);
+          accPx += segPx;
+          if (accPx >= arrowEveryPx) {
+            accPx = 0;
+            const angle = Math.atan2(py2 - py1, px2 - px1);
+            let s = getMagAt(0.5 * (x1 + x2), 0.5 * (y1 + y2));
+            if (!Number.isFinite(s)) s = Math.hypot(x2 - x1, y2 - y1);
+            const t = (s - speedMin) / span;
+            const fill = speedToColor(t);
+            const head = 7;
+            ctx.beginPath();
+            ctx.moveTo(px2, py2);
+            ctx.lineTo(px2 - head * Math.cos(angle - Math.PI / 6), py2 - head * Math.sin(angle - Math.PI / 6));
+            ctx.lineTo(px2 - head * Math.cos(angle + Math.PI / 6), py2 - head * Math.sin(angle + Math.PI / 6));
+            ctx.closePath();
+            ctx.fillStyle = fill;
+            ctx.fill();
+            ctx.strokeStyle = "rgba(15, 23, 42, 0.9)";
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+          }
+        }
+      });
+      ctx.restore();
+    }
+  }, [workerData, domain, viewportTick, layers]);
 
   React.useEffect(() => {
     const canvas = canvasRef.current;
@@ -801,24 +887,26 @@ export default function PhasePlane() {
           </div>
           <div className="relative flex-1">
             <canvas ref={canvasRef} width={900} height={700} className="w-full h-full bg-slate-950" />
-            <div className="absolute top-3 left-3 bg-slate-900/70 backdrop-blur-md rounded-lg px-3 py-2 text-xs border border-slate-700 flex flex-wrap items-center gap-3">
-              <div className="flex items-center gap-2">
-                <span>ẋ=</span>
-                <input
-                  className="w-56 bg-slate-900/60 rounded px-2 py-1 border border-slate-700"
-                  value={exprX}
-                  onChange={(event) => setExprX(event.target.value)}
-                />
+            <div className="absolute top-3 left-3 bg-slate-900/70 backdrop-blur-md rounded-lg px-3 py-2 text-xs border border-slate-700 flex flex-col gap-2 w-max max-w-[calc(100%-220px)]">
+              <div className="flex flex-wrap items-center gap-3">
+                <div className="flex items-center gap-2">
+                  <span>ẋ=</span>
+                  <input
+                    className="w-56 bg-slate-900/60 rounded px-2 py-1 border border-slate-700"
+                    value={exprX}
+                    onChange={(event) => setExprX(event.target.value)}
+                  />
+                </div>
+                <div className="flex items-center gap-2">
+                  <span>ẏ=</span>
+                  <input
+                    className="w-56 bg-slate-900/60 rounded px-2 py-1 border border-slate-700"
+                    value={exprY}
+                    onChange={(event) => setExprY(event.target.value)}
+                  />
+                </div>
               </div>
-              <div className="flex items-center gap-2">
-                <span>ẏ=</span>
-                <input
-                  className="w-56 bg-slate-900/60 rounded px-2 py-1 border border-slate-700"
-                  value={exprY}
-                  onChange={(event) => setExprY(event.target.value)}
-                />
-              </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-3">
                 <span className="opacity-70">bounds</span>
                 <input
                   title="xMin"
@@ -856,10 +944,10 @@ export default function PhasePlane() {
                   onBlur={commitDomainValue("yMax")}
                   onKeyDown={handleDomainKeyDown("yMax")}
                 />
-                <label className="text-xs text-slate-300">
-                  grid
+                <label className="text-xs text-slate-300 flex items-center gap-2">
+                  <span>grid</span>
                   <input
-                    className="ml-2 w-20 bg-slate-900/60 rounded px-2 py-1 border border-slate-700"
+                    className="w-20 bg-slate-900/60 rounded px-2 py-1 border border-slate-700"
                     type="number"
                     value={gridInput}
                     min={8}
@@ -869,28 +957,57 @@ export default function PhasePlane() {
                     onKeyDown={handleGridKeyDown}
                   />
                 </label>
-                <button
-                  className="ml-2 px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 border border-slate-600 disabled:opacity-50"
-                  title="Add a random seed"
-                  disabled={animCache.isPrecomputing}
-                  onClick={() => {
-                    const x = lerp(domain.xMin, domain.xMax, Math.random());
-                    const y = lerp(domain.yMin, domain.yMax, Math.random());
-                    setSeeds((prev) => [...prev, [x, y]]);
-                  }}
-                >
-                  Seed
-                </button>
-                <button
-                  className="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 border border-slate-600 disabled:opacity-50"
-                  title="Clear seeds"
-                  disabled={animCache.isPrecomputing}
-                  onClick={() => setSeeds([])}
-                >
-                  Clear
-                </button>
+                <div className="flex items-center gap-2 ml-auto">
+                  <button
+                    className="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 border border-slate-600 disabled:opacity-50"
+                    title="Add a random seed"
+                    disabled={animCache.isPrecomputing}
+                    onClick={() => {
+                      const x = lerp(domain.xMin, domain.xMax, Math.random());
+                      const y = lerp(domain.yMin, domain.yMax, Math.random());
+                      setSeeds((prev) => [...prev, [x, y]]);
+                    }}
+                  >
+                    Seed
+                  </button>
+                  <button
+                    className="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 border border-slate-600 disabled:opacity-50"
+                    title="Clear seeds"
+                    disabled={animCache.isPrecomputing}
+                    onClick={() => setSeeds([])}
+                  >
+                    Clear
+                  </button>
+                </div>
               </div>
             </div>
+            {layers.legend && (
+              <div className="absolute top-3 right-3 bg-slate-900/80 backdrop-blur-md rounded-lg px-3 py-2 text-xs border border-slate-700 min-w-[200px]">
+                <div className="text-slate-300 mb-2">Legend</div>
+                <div className="space-y-2">
+                  <div>
+                    <div className="flex items-center justify-between text-[10px] text-slate-400 mb-1">
+                      <span>slow</span>
+                      <span>fast</span>
+                    </div>
+                    <div className="h-2 rounded" style={{ background: 'linear-gradient(to right, rgb(0, 0, 255), rgb(255, 0, 0))' }} />
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="inline-block w-3 h-0.5 bg-cyan-400" />
+                    <span className="text-slate-400">f = 0</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="inline-block w-3 h-0.5 bg-pink-400" />
+                    <span className="text-slate-400">g = 0</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="inline-block w-2 h-2 rounded-full bg-yellow-200 border border-amber-500" />
+                    <span className="text-slate-400">equilibrium</span>
+                  </div>
+                  <div className="text-[10px] text-slate-400">trajectory color ∝ speed</div>
+                </div>
+              </div>
+            )}
           </div>
         </div>
 
@@ -1077,6 +1194,70 @@ export default function PhasePlane() {
           </div>
 
           <ConsolePanel logs={logs} onCommand={onCommand} />
+
+          <div className="bg-slate-800/60 rounded-2xl p-3">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-sm text-slate-300 font-medium">Layers</span>
+            </div>
+            <div className="grid grid-cols-2 gap-2 text-xs">
+              <button
+                className={`flex items-center justify-between px-2 py-1 rounded border ${layers.axes ? 'bg-slate-700 border-slate-600' : 'bg-slate-900/40 border-slate-700'} hover:bg-slate-700`}
+                onClick={() => toggleLayer('axes')}
+                title="Toggle axes"
+              >
+                <span>Axes</span>
+                <span className="opacity-70">{layers.axes ? '👁️' : '🚫'}</span>
+              </button>
+              <button
+                className={`flex items-center justify-between px-2 py-1 rounded border ${layers.vectorField ? 'bg-slate-700 border-slate-600' : 'bg-slate-900/40 border-slate-700'} hover:bg-slate-700`}
+                onClick={() => toggleLayer('vectorField')}
+                title="Toggle vector field"
+              >
+                <span>Vector field</span>
+                <span className="opacity-70">{layers.vectorField ? '👁️' : '🚫'}</span>
+              </button>
+              <button
+                className={`flex items-center justify-between px-2 py-1 rounded border ${layers.nullclineF ? 'bg-slate-700 border-slate-600' : 'bg-slate-900/40 border-slate-700'} hover:bg-slate-700`}
+                onClick={() => toggleLayer('nullclineF')}
+                title="Toggle f=0"
+              >
+                <span>f = 0</span>
+                <span className="opacity-70">{layers.nullclineF ? '👁️' : '🚫'}</span>
+              </button>
+              <button
+                className={`flex items-center justify-between px-2 py-1 rounded border ${layers.nullclineG ? 'bg-slate-700 border-slate-600' : 'bg-slate-900/40 border-slate-700'} hover:bg-slate-700`}
+                onClick={() => toggleLayer('nullclineG')}
+                title="Toggle g=0"
+              >
+                <span>g = 0</span>
+                <span className="opacity-70">{layers.nullclineG ? '👁️' : '🚫'}</span>
+              </button>
+              <button
+                className={`flex items-center justify-between px-2 py-1 rounded border ${layers.equilibria ? 'bg-slate-700 border-slate-600' : 'bg-slate-900/40 border-slate-700'} hover:bg-slate-700`}
+                onClick={() => toggleLayer('equilibria')}
+                title="Toggle equilibria"
+              >
+                <span>Equilibria</span>
+                <span className="opacity-70">{layers.equilibria ? '👁️' : '🚫'}</span>
+              </button>
+              <button
+                className={`flex items-center justify-between px-2 py-1 rounded border ${layers.trajectories ? 'bg-slate-700 border-slate-600' : 'bg-slate-900/40 border-slate-700'} hover:bg-slate-700`}
+                onClick={() => toggleLayer('trajectories')}
+                title="Toggle trajectories"
+              >
+                <span>Trajectories</span>
+                <span className="opacity-70">{layers.trajectories ? '👁️' : '🚫'}</span>
+              </button>
+              <button
+                className={`flex items-center justify-between px-2 py-1 rounded border ${layers.legend ? 'bg-slate-700 border-slate-600' : 'bg-slate-900/40 border-slate-700'} hover:bg-slate-700`}
+                onClick={() => toggleLayer('legend')}
+                title="Toggle legend overlay"
+              >
+                <span>Legend</span>
+                <span className="opacity-70">{layers.legend ? '👁️' : '🚫'}</span>
+              </button>
+            </div>
+          </div>
         </div>
       </div>
     </div>
